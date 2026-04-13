@@ -1,0 +1,18 @@
+2026-03-19T06:23:36.175Z [INFO]: 🚀 Multi-game server running on http://localhost:3000
+2026-03-19T06:23:36.177Z [INFO]: 📡 WebSocket endpoint: ws://localhost:3000
+2026-03-19T06:23:36.178Z [INFO]: 🎮 Supported games: ball-crush, checkers, flappy-bird
+2026-03-19T06:23:36.178Z [INFO]: 📊 Health check: http://localhost:3000/health
+2026-03-19T06:25:42.709Z [INFO]: 🚀 Multi-game server running on http://localhost:3001
+2026-03-19T06:25:42.711Z [INFO]: 📡 WebSocket endpoint: ws://localhost:3001
+2026-03-19T06:25:42.712Z [INFO]: 🎮 Supported games: ball-crush, checkers, flappy-bird
+2026-03-19T06:25:42.712Z [INFO]: 📊 Health check: http://localhost:3001/health
+2026-03-19T06:29:39.771Z [INFO]: 🚀 Multi-game server running on http://localhost:3001
+2026-03-19T06:29:39.773Z [INFO]: 📡 WebSocket endpoint: ws://localhost:3001
+2026-03-19T06:29:39.773Z [INFO]: 🎮 Supported games: ball-crush, checkers, flappy-bird
+2026-03-19T06:29:39.773Z [INFO]: 📊 Health check: http://localhost:3001/health
+2026-03-19T06:32:19.297Z [INFO]: 🚀 Multi-game server running on http://localhost:3001
+2026-03-19T06:32:19.299Z [INFO]: 📡 WebSocket endpoint: ws://localhost:3001
+2026-03-19T06:32:19.300Z [INFO]: 🎮 Supported games: ball-crush, checkers, flappy-bird
+2026-03-19T06:32:19.300Z [INFO]: 📊 Health check: http://localhost:3001/health
+2026-03-19T06:32:23.197Z [INFO]: 🔌 New connection: sqLvKiYO170SxVcPAAAC
+2026-03-19T06:32:23.206Z [INFO]: 🎮 TestPlayer1 joined checkers matchmaking

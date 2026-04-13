@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Multi-Game Server Test</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script>
+        const socket = io('http://localhost:3001');
+        
+        socket.on('connect', () => {
+            console.log('Connected to server');
+            
+            // Join checkers matchmaking
+            socket.emit('joinMatchmaking', {
+                gameId: 'checkers',
+                uid: 'test-player-1',
+                username: 'TestPlayer1',
+                displayName: 'Test Player 1'
+            }, (response) => {
+                console.log('Join response:', response);
+            });
+        });
+        
+        socket.on('queueUpdate', (data) => {
+            console.log('Queue update:', data);
+        });
+        
+        socket.on('gameStarted', (data) => {
+            console.log('Game started!', data);
+        });
+    </script>
+</head>
+<body>
+    <h1>Multi-Game Server Test</h1>
+    <p>Open console to see results</p>
+</body>
+</html>
