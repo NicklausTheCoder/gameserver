@@ -2,10 +2,11 @@
   "name": "multi-game-server",
   "version": "1.0.0",
   "description": "Multi-game online server for Ball Crush, Checkers, and Flappy Bird",
-  "main": "index.js",
+  "main": "simple-server.js",
   "scripts": {
+    "build": "echo 'No build step required'",
     "start": "node simple-server.js",
-    "dev": "node simple-server.js"
+    "dev": "nodemon simple-server.js"
   },
   "dependencies": {
     "@paypal/checkout-server-sdk": "^1.0.3",
@@ -27,3 +28,4 @@
   "author": "",
   "license": "ISC"
 }
+
