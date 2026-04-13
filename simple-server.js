@@ -307,8 +307,8 @@ function getPaynow() {
     if (!process.env.PAYNOW_INTEGRATION_ID || !process.env.PAYNOW_INTEGRATION_KEY)
         throw new Error('PAYNOW credentials not set');
     const pn = new Paynow(process.env.PAYNOW_INTEGRATION_ID, process.env.PAYNOW_INTEGRATION_KEY);
-    const backendUrl = process.env.SERVER_URL || 'http://localhost:3001';
-    const frontendUrl = process.env.REACT_APP_FRONTEND_URL || 'http://localhost:3000';
+    const backendUrl = process.env.SERVER_URL || 'https://game-server-xvdu.onrender.com';
+    const frontendUrl = process.env.REACT_APP_FRONTEND_URL || 'https://wintapgames.com';
     pn.resultUrl = `${backendUrl}/api/paynow/callback`;
     pn.returnUrl = `${frontendUrl}/wallet?status=returned`;
     return pn;
@@ -986,5 +986,5 @@ module.exports = { registerPaymentRoutes, finalizePayment, getStripe };
 registerPaymentRoutes(app);
 const PORT = 3001;
 server.listen(PORT, () => {
-    console.log(`🎮 Socket server running on http://localhost:${PORT}`);
+    console.log(`🎮 Socket server running on https://game-server-xvdu.onrender.com:${PORT}`);
 });
