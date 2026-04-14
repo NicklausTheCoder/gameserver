@@ -163,28 +163,50 @@ const BC = {
 
 class BallCrushRoom {
   constructor(roomId) {
-    this.roomId     = roomId;
-    this.players    = [];   // [{ socketId, uid, username, role:'bottom'|'top' }]
-    this.active     = false;
-    this.intervalId = null;
-    this.paddleX    = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 };
-    this.health     = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
-    this.score      = { bottom: 0, top: 0 };
-    this.hitCount   = 0;
+    this.roomId         = roomId;
+    this.players        = [];
+    this.active         = false;
+    this.intervalId     = null;
+    this.paddleX        = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 };
+    this.health         = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
+    this.score          = { bottom: 0, top: 0 };
+    this.hitCount       = 0;
+    this.pauseTicksLeft = 0;    // physics freeze countdown after each point
+    this._pendingServe  = null; // direction to serve when pause expires
     this.resetBall('bottom');
   }
 
-  // ── Ball reset: place ball at centre, serve toward 'serveToward' ────────
-  resetBall(serveToward) {
-    this.ball = { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 };
+  // ── How many ticks (~33ms each) to freeze after a point ─────────────────
+  // 45 ticks ≈ 1.5 s — clients snap to centre, flash animation clears.
+  static get RESET_PAUSE_TICKS() { return 45; }
 
-    // ±30° from straight vertical so it's never perfectly straight
-    const angle = (Math.random() * 60 - 30) * (Math.PI / 180);
-    const dir   = serveToward === 'bottom' ? 1 : -1;
+  // ── Ball reset ───────────────────────────────────────────────────────────
+  // Freezes ball at centre and queues the serve direction.
+  // The actual velocity is applied after RESET_PAUSE_TICKS ticks.
+  // Also emits 'ballReset' so clients SNAP the ball (no lerp) to centre.
+  resetBall(serveToward) {
+    this.ball           = { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 };
+    this.ballVel        = { x: 0, y: 0 };
+    this._pendingServe  = serveToward;
+    this.pauseTicksLeft = BallCrushRoom.RESET_PAUSE_TICKS;
+
+    // Tell every client to snap the ball to centre right now
+    this.players.forEach(({ socketId }) => {
+      const s = io.sockets.sockets.get(socketId);
+      if (s) s.emit('ballReset', { ball: { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 } });
+    });
+  }
+
+  // ── Apply queued serve velocity once the pause expires ──────────────────
+  _launchBall() {
+    if (!this._pendingServe) return;
+    const angle = (Math.random() * 60 - 30) * (Math.PI / 180); // ±30°
+    const dir   = this._pendingServe === 'bottom' ? 1 : -1;
     this.ballVel = {
       x: Math.sin(angle) * BC.INITIAL_SPEED,
       y: Math.cos(angle) * BC.INITIAL_SPEED * dir,
     };
+    this._pendingServe = null;
   }
 
   // ── Current ball speed (magnitude) ─────────────────────────────────────
@@ -205,6 +227,15 @@ class BallCrushRoom {
 
   // ── One physics tick — uses sub-stepping to prevent tunneling ──────────
   tick() {
+    // ── Post-point pause ─────────────────────────────────────────────────
+    // While pauseTicksLeft > 0 the ball stays frozen at centre.
+    // On the tick the pause expires we launch the ball with a fresh angle.
+    if (this.pauseTicksLeft > 0) {
+      this.pauseTicksLeft--;
+      if (this.pauseTicksLeft === 0) this._launchBall();
+      return; // skip all physics this tick
+    }
+
     const vel       = this.ballVel;
     const stepSize  = BC.BALL_RADIUS;            // max pixels per sub-step
     const dist      = Math.sqrt(vel.x ** 2 + vel.y ** 2);
