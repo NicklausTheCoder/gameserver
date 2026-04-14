@@ -108,62 +108,78 @@ function applyMove(board, fromRow, fromCol, toRow, toCol) {
 }
 
 // ============================================================
-// SECTION 2 – BALL CRUSH (new)
+// SECTION 2 – BALL CRUSH
 // ============================================================
 //
 // Architecture
 // ────────────
 //  • Each Ball Crush match lives in a BallCrushRoom object.
 //  • The server owns the ball entirely (position, velocity, physics).
-//  • Clients own only their own paddle position (sent via paddleMove).
+//  • Clients own only their own paddle X position (sent via paddleMove).
 //  • The server broadcasts gameState at ~30 Hz to both players.
 //  • The server decides scores, health, speed bumps, and game-over.
 //
-// Coordinate system
-// ─────────────────
-//  Both players see a 360 × 640 canvas.
-//  "bottom" player's paddle is near y=550; "top" player's near y=50.
-//  The SERVER stores coords in the "bottom player's perspective":
-//    bottom paddle → high Y (≈550), top paddle → low Y (≈50).
-//  When sending gameState the server flips coords for the "top" player
-//  so both players always receive their own paddle near y=550.
+// Coordinate system (server-side)
+// ────────────────────────────────
+//  360 × 640 canvas. Y increases downward.
+//  bottom player paddle → y = 550  (high Y)
+//  top    player paddle → y = 50   (low Y)
+//  Server stores everything in this "bottom perspective".
+//  broadcastState() flips Y for the top player so both clients
+//  always see their own paddle near y = 550.
 //
-// Game constants (mirror these in the client if ever needed)
-// ─────────────────────────────────────────────────────────
+// Collision approach — sweep + depenetration
+// ───────────────────────────────────────────
+//  BUG FIXED #1 — Tunneling:
+//    At high speeds the ball can jump clean through a thin paddle
+//    in one tick. We solve this by sweeping along the ball's path
+//    in small sub-steps (up to MAX_SUBSTEPS per tick) so no step
+//    ever moves the ball more than BALL_RADIUS pixels.
+//
+//  BUG FIXED #2 — Ghost / double bounces:
+//    After a reflection we push the ball to sit flush against the
+//    paddle surface (depenetration). This guarantees the ball is
+//    outside the hitbox before the next tick, so it can never
+//    re-trigger the same paddle on the very next frame.
+//
+// ─────────────────────────────────────────────────────────────
+
 const BC = {
-  WIDTH:          360,
-  HEIGHT:         640,
-  BALL_RADIUS:    18,
-  PADDLE_W:       80,   // half-width of paddle hitbox
-  PADDLE_H:       10,   // half-height of paddle hitbox
+  WIDTH:           360,
+  HEIGHT:          640,
+  BALL_RADIUS:     18,
+  PADDLE_HALF_W:   50,   // half-width  of paddle hitbox  (total = 100 px)
+  PADDLE_HALF_H:   10,   // half-height of paddle hitbox  (total =  20 px)
   BOTTOM_PADDLE_Y: 550,
   TOP_PADDLE_Y:    50,
   INITIAL_SPEED:   5,
-  SPEED_BUMP_EVERY: 5,  // score points before speed increase
+  SPEED_BUMP_EVERY: 5,   // every N paddle hits → speed increase
   SPEED_BUMP_MULT:  1.15,
   MAX_SPEED:        14,
   MAX_HEALTH:       5,
-  TICK_MS:          33, // ~30 Hz
+  TICK_MS:          33,  // ~30 Hz game loop
+  MAX_SUBSTEPS:     8,   // sub-step cap — prevents infinite loops
 };
 
 class BallCrushRoom {
   constructor(roomId) {
-    this.roomId   = roomId;
-    this.players  = [];   // [{ socketId, uid, username, role:'bottom'|'top' }]
-    this.active   = false;
+    this.roomId     = roomId;
+    this.players    = [];   // [{ socketId, uid, username, role:'bottom'|'top' }]
+    this.active     = false;
     this.intervalId = null;
-    this.resetBall('bottom'); // initial serve toward bottom
-    this.paddleX  = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 };
-    this.health   = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
-    this.score    = { bottom: 0, top: 0 };
-    this.hitCount = 0; // total paddle hits — used for speed bumps
+    this.paddleX    = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 };
+    this.health     = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
+    this.score      = { bottom: 0, top: 0 };
+    this.hitCount   = 0;
+    this.resetBall('bottom');
   }
 
-  // ── Ball reset ──────────────────────────────────────────────────────────
+  // ── Ball reset: place ball at centre, serve toward 'serveToward' ────────
   resetBall(serveToward) {
     this.ball = { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 };
 
-    const angle = (Math.random() * 60 - 30) * (Math.PI / 180); // ±30° from vertical
+    // ±30° from straight vertical so it's never perfectly straight
+    const angle = (Math.random() * 60 - 30) * (Math.PI / 180);
     const dir   = serveToward === 'bottom' ? 1 : -1;
     this.ballVel = {
       x: Math.sin(angle) * BC.INITIAL_SPEED,
@@ -171,91 +187,120 @@ class BallCrushRoom {
     };
   }
 
-  // ── One physics tick ────────────────────────────────────────────────────
+  // ── Current ball speed (magnitude) ─────────────────────────────────────
+  currentSpeed() {
+    return Math.sqrt(this.ballVel.x ** 2 + this.ballVel.y ** 2);
+  }
+
+  // ── AABB overlap between ball centre and a paddle ──────────────────────
+  //    Returns true if the ball overlaps the paddle rectangle.
+  ballOverlapsPaddle(ballX, ballY, paddleX, paddleY) {
+    const dx = Math.abs(ballX - paddleX);
+    const dy = Math.abs(ballY - paddleY);
+    return (
+      dx <= BC.PADDLE_HALF_W + BC.BALL_RADIUS &&
+      dy <= BC.PADDLE_HALF_H + BC.BALL_RADIUS
+    );
+  }
+
+  // ── One physics tick — uses sub-stepping to prevent tunneling ──────────
   tick() {
-    const ball = this.ball;
-    const vel  = this.ballVel;
+    const vel       = this.ballVel;
+    const stepSize  = BC.BALL_RADIUS;            // max pixels per sub-step
+    const dist      = Math.sqrt(vel.x ** 2 + vel.y ** 2);
+    const steps     = Math.min(BC.MAX_SUBSTEPS, Math.ceil(dist / stepSize));
+    const dx        = vel.x / steps;
+    const dy        = vel.y / steps;
 
-    // Move ball
-    ball.x += vel.x;
-    ball.y += vel.y;
+    for (let s = 0; s < steps; s++) {
+      // Advance ball one sub-step
+      this.ball.x += dx;
+      this.ball.y += dy;
 
-    // ── Wall bounce (left / right) ──────────────────────────────────────
-    if (ball.x - BC.BALL_RADIUS <= 0) {
-      ball.x = BC.BALL_RADIUS;
-      vel.x  = Math.abs(vel.x);
-    } else if (ball.x + BC.BALL_RADIUS >= BC.WIDTH) {
-      ball.x = BC.WIDTH - BC.BALL_RADIUS;
-      vel.x  = -Math.abs(vel.x);
-    }
+      // ── Left / right wall bounce ─────────────────────────────────────
+      if (this.ball.x - BC.BALL_RADIUS <= 0) {
+        this.ball.x = BC.BALL_RADIUS;
+        vel.x = Math.abs(vel.x);
+      } else if (this.ball.x + BC.BALL_RADIUS >= BC.WIDTH) {
+        this.ball.x = BC.WIDTH - BC.BALL_RADIUS;
+        vel.x = -Math.abs(vel.x);
+      }
 
-    // ── Paddle collision helpers ────────────────────────────────────────
-    const hitPaddle = (paddleX, paddleY) => {
-      const dx = Math.abs(ball.x - paddleX);
-      const dy = Math.abs(ball.y - paddleY);
-      return dx <= BC.PADDLE_W / 2 + BC.BALL_RADIUS &&
-             dy <= BC.PADDLE_H   + BC.BALL_RADIUS;
-    };
+      // ── Bottom paddle — only check when ball is moving downward ──────
+      //    vel.y > 0 means moving toward bottom paddle (high Y).
+      if (vel.y > 0 && this.ballOverlapsPaddle(this.ball.x, this.ball.y, this.paddleX.bottom, BC.BOTTOM_PADDLE_Y)) {
+        // Depenetrate: push ball to sit on top of paddle surface
+        this.ball.y = BC.BOTTOM_PADDLE_Y - BC.PADDLE_HALF_H - BC.BALL_RADIUS;
+        this.onPaddleHit('bottom');
+        return; // done with this tick — ball direction has changed
+      }
 
-    // ── Bottom paddle (high Y) ──────────────────────────────────────────
-    if (vel.y > 0 && hitPaddle(this.paddleX.bottom, BC.BOTTOM_PADDLE_Y)) {
-      this.onPaddleHit('bottom', ball);
-      return; // skip scoring this tick
-    }
+      // ── Top paddle — only check when ball is moving upward ───────────
+      //    vel.y < 0 means moving toward top paddle (low Y).
+      if (vel.y < 0 && this.ballOverlapsPaddle(this.ball.x, this.ball.y, this.paddleX.top, BC.TOP_PADDLE_Y)) {
+        // Depenetrate: push ball to sit below paddle surface
+        this.ball.y = BC.TOP_PADDLE_Y + BC.PADDLE_HALF_H + BC.BALL_RADIUS;
+        this.onPaddleHit('top');
+        return;
+      }
 
-    // ── Top paddle (low Y) ─────────────────────────────────────────────
-    if (vel.y < 0 && hitPaddle(this.paddleX.top, BC.TOP_PADDLE_Y)) {
-      this.onPaddleHit('top', ball);
-      return;
-    }
+      // ── Ball exits bottom edge → top player scores ───────────────────
+      if (this.ball.y + BC.BALL_RADIUS >= BC.HEIGHT) {
+        this.onPoint('top');
+        return;
+      }
 
-    // ── Scoring: ball exits bottom edge → top scores ────────────────────
-    if (ball.y + BC.BALL_RADIUS >= BC.HEIGHT) {
-      this.onPoint('top');
-      return;
-    }
-
-    // ── Scoring: ball exits top edge → bottom scores ────────────────────
-    if (ball.y - BC.BALL_RADIUS <= 0) {
-      this.onPoint('bottom');
+      // ── Ball exits top edge → bottom player scores ───────────────────
+      if (this.ball.y - BC.BALL_RADIUS <= 0) {
+        this.onPoint('bottom');
+        return;
+      }
     }
   }
 
-  // ── Paddle hit ──────────────────────────────────────────────────────────
-  onPaddleHit(role, ball) {
+  // ── Paddle hit handler ──────────────────────────────────────────────────
+  //    Called AFTER the ball has already been depenetrated (repositioned
+  //    outside the hitbox), so this can never double-fire.
+  onPaddleHit(role) {
     this.hitCount++;
     this.score[role]++;
 
-    // Reflect ball away from paddle
+    const ball = this.ball;
+
+    // Reflect Y away from the paddle
     this.ballVel.y = role === 'bottom'
-      ? -Math.abs(this.ballVel.y)   // send upward
-      :  Math.abs(this.ballVel.y);  // send downward
+      ? -Math.abs(this.ballVel.y)  // send upward
+      :  Math.abs(this.ballVel.y); // send downward
 
-    // Add slight angular variation based on where ball hit the paddle
-    const offset = (ball.x - this.paddleX[role]) / (BC.PADDLE_W / 2); // –1 to +1
-    this.ballVel.x = offset * this.currentSpeed() * 0.8;
+    // Angle based on where the ball hit relative to paddle centre.
+    // offset is –1 (far left) to +1 (far right).
+    // We clamp it so the ball can never go perfectly horizontal.
+    const offset = Math.max(-0.9, Math.min(0.9,
+      (ball.x - this.paddleX[role]) / BC.PADDLE_HALF_W
+    ));
+    const speed = this.currentSpeed();
+    this.ballVel.x = offset * speed * 0.75;
 
-    // Speed bump every N hits
-    let bumped = false;
+    // Re-normalise so speed stays consistent after angle change
+    const newSpeed = this.currentSpeed();
+    if (newSpeed > 0) {
+      this.ballVel.x = (this.ballVel.x / newSpeed) * speed;
+      this.ballVel.y = (this.ballVel.y / newSpeed) * speed;
+    }
+
+    // Speed bump every BC.SPEED_BUMP_EVERY hits
     if (this.hitCount % BC.SPEED_BUMP_EVERY === 0) {
       const current = this.currentSpeed();
       if (current < BC.MAX_SPEED) {
-        const mult = BC.SPEED_BUMP_MULT;
-        this.ballVel.x *= mult;
-        this.ballVel.y *= mult;
-        bumped = true;
-        io.to(this.roomId).emit('speedBump', { multiplier: mult });
-        console.log(`⚡ [BallCrush] ${this.roomId} speed bump x${mult}`);
+        this.ballVel.x *= BC.SPEED_BUMP_MULT;
+        this.ballVel.y *= BC.SPEED_BUMP_MULT;
+        io.to(this.roomId).emit('speedBump', { multiplier: BC.SPEED_BUMP_MULT });
+        console.log(`⚡ [BallCrush] ${this.roomId} speed bump ×${BC.SPEED_BUMP_MULT} | speed=${this.currentSpeed().toFixed(2)}`);
       }
     }
 
-    // Broadcast to both players (server sends role-corrected data below in broadcastState)
-    io.to(this.roomId).emit('paddleHit', {
-      role:  role,
-      score: this.score[role],
-    });
-
-    console.log(`🏓 [BallCrush] ${this.roomId} | ${role} hit | score=${this.score[role]} | hitCount=${this.hitCount}`);
+    io.to(this.roomId).emit('paddleHit', { role, score: this.score[role] });
+    console.log(`🏓 [BallCrush] ${this.roomId} | ${role} hit #${this.hitCount} | score=${this.score[role]}`);
   }
 
   // ── Point scored ────────────────────────────────────────────────────────
@@ -294,11 +339,6 @@ class BallCrushRoom {
 
     // Clean up after 30 s so disconnected clients still get the event
     setTimeout(() => ballCrushRooms.delete(this.roomId), 30_000);
-  }
-
-  // ── Current ball speed (magnitude) ─────────────────────────────────────
-  currentSpeed() {
-    return Math.sqrt(this.ballVel.x ** 2 + this.ballVel.y ** 2);
   }
 
   // ── Broadcast state to both players with perspective flip ───────────────
