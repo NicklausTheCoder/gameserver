@@ -145,34 +145,34 @@ function applyMove(board, fromRow, fromCol, toRow, toCol) {
 // ─────────────────────────────────────────────────────────────
 
 const BC = {
-  WIDTH:           360,
-  HEIGHT:          640,
-  BALL_RADIUS:     18,
-  PADDLE_HALF_W:   50,   // half-width  of paddle hitbox  (total = 100 px)
-  PADDLE_HALF_H:   10,   // half-height of paddle hitbox  (total =  20 px)
+  WIDTH: 360,
+  HEIGHT: 640,
+  BALL_RADIUS: 18,
+  PADDLE_HALF_W: 50,   // half-width  of paddle hitbox  (total = 100 px)
+  PADDLE_HALF_H: 10,   // half-height of paddle hitbox  (total =  20 px)
   BOTTOM_PADDLE_Y: 550,
-  TOP_PADDLE_Y:    50,
-  INITIAL_SPEED:   5,
+  TOP_PADDLE_Y: 50,
+  INITIAL_SPEED: 9,
   SPEED_BUMP_EVERY: 5,   // every N paddle hits → speed increase
-  SPEED_BUMP_MULT:  1.15,
-  MAX_SPEED:        14,
-  MAX_HEALTH:       5,
-  TICK_MS:          33,  // ~30 Hz game loop
-  MAX_SUBSTEPS:     8,   // sub-step cap — prevents infinite loops
+  SPEED_BUMP_MULT: 1.20,
+  MAX_SPEED: 20,
+  MAX_HEALTH: 5,
+  TICK_MS: 33,  // ~30 Hz game loop
+  MAX_SUBSTEPS: 8,   // sub-step cap — prevents infinite loops
 };
 
 class BallCrushRoom {
   constructor(roomId) {
-    this.roomId         = roomId;
-    this.players        = [];
-    this.active         = false;
-    this.intervalId     = null;
-    this.paddleX        = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 };
-    this.health         = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
-    this.score          = { bottom: 0, top: 0 };
-    this.hitCount       = 0;
+    this.roomId = roomId;
+    this.players = [];
+    this.active = false;
+    this.intervalId = null;
+    this.paddleX = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 };
+    this.health = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
+    this.score = { bottom: 0, top: 0 };
+    this.hitCount = 0;
     this.pauseTicksLeft = 0;    // physics freeze countdown after each point
-    this._pendingServe  = null; // direction to serve when pause expires
+    this._pendingServe = null; // direction to serve when pause expires
     this.resetBall('bottom');
   }
 
@@ -185,9 +185,9 @@ class BallCrushRoom {
   // The actual velocity is applied after RESET_PAUSE_TICKS ticks.
   // Also emits 'ballReset' so clients SNAP the ball (no lerp) to centre.
   resetBall(serveToward) {
-    this.ball           = { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 };
-    this.ballVel        = { x: 0, y: 0 };
-    this._pendingServe  = serveToward;
+    this.ball = { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 };
+    this.ballVel = { x: 0, y: 0 };
+    this._pendingServe = serveToward;
     this.pauseTicksLeft = BallCrushRoom.RESET_PAUSE_TICKS;
 
     // Tell every client to snap the ball to centre right now
@@ -201,7 +201,7 @@ class BallCrushRoom {
   _launchBall() {
     if (!this._pendingServe) return;
     const angle = (Math.random() * 60 - 30) * (Math.PI / 180); // ±30°
-    const dir   = this._pendingServe === 'bottom' ? 1 : -1;
+    const dir = this._pendingServe === 'bottom' ? 1 : -1;
     this.ballVel = {
       x: Math.sin(angle) * BC.INITIAL_SPEED,
       y: Math.cos(angle) * BC.INITIAL_SPEED * dir,
@@ -212,6 +212,52 @@ class BallCrushRoom {
   // ── Current ball speed (magnitude) ─────────────────────────────────────
   currentSpeed() {
     return Math.sqrt(this.ballVel.x ** 2 + this.ballVel.y ** 2);
+  }
+
+  // ── Game over ───────────────────────────────────────────────────────────
+  async endGame(winnerRole) {
+    this.active = false;
+    if (this.intervalId) { clearInterval(this.intervalId); this.intervalId = null; }
+
+    const winner = this.players.find(p => p.role === winnerRole);
+    io.to(this.roomId).emit('gameOver', {
+      winnerRole,
+      winnerUsername: winner ? winner.username : 'Unknown',
+    });
+
+    console.log(`🏆 [BallCrush] ${this.roomId} game over — winner: ${winnerRole}`);
+
+    // ── Award prize to winner ──────────────────────────────────────────
+    if (winner?.uid) {
+      try {
+        const db = admin.database();
+        const prize = 1.50;
+
+        const winningsRef = db.ref(`winningsBalance/${winner.uid}`);
+        const snap = await winningsRef.once('value');
+        const current = snap.exists() ? (snap.val().balance || 0) : 0;
+
+        await winningsRef.update({
+          balance: current + prize,
+          lastUpdated: new Date().toISOString(),
+        });
+
+        await db.ref(`winnings/${winner.uid}/${this.roomId}`).set({
+          amount: prize,
+          game: 'ball-crush',
+          lobbyId: this.roomId,
+          awardedAt: new Date().toISOString(),
+        });
+
+        console.log(`💰 [BallCrush] Awarded $${prize} to ${winner.username} (${winner.uid})`);
+        console.log(`💰 [BallCrush] New winnings balance for ${winner.username}: $${(current + prize).toFixed(2)}`);
+      } catch (err) {
+        console.error('❌ [BallCrush] Failed to award prize:', err);
+      }
+    }
+
+    // Clean up after 30 s
+    setTimeout(() => ballCrushRooms.delete(this.roomId), 30_000);
   }
 
   // ── AABB overlap between ball centre and a paddle ──────────────────────
@@ -236,12 +282,12 @@ class BallCrushRoom {
       return; // skip all physics this tick
     }
 
-    const vel       = this.ballVel;
-    const stepSize  = BC.BALL_RADIUS;            // max pixels per sub-step
-    const dist      = Math.sqrt(vel.x ** 2 + vel.y ** 2);
-    const steps     = Math.min(BC.MAX_SUBSTEPS, Math.ceil(dist / stepSize));
-    const dx        = vel.x / steps;
-    const dy        = vel.y / steps;
+    const vel = this.ballVel;
+    const stepSize = BC.BALL_RADIUS;            // max pixels per sub-step
+    const dist = Math.sqrt(vel.x ** 2 + vel.y ** 2);
+    const steps = Math.min(BC.MAX_SUBSTEPS, Math.ceil(dist / stepSize));
+    const dx = vel.x / steps;
+    const dy = vel.y / steps;
 
     for (let s = 0; s < steps; s++) {
       // Advance ball one sub-step
@@ -301,7 +347,7 @@ class BallCrushRoom {
     // Reflect Y away from the paddle
     this.ballVel.y = role === 'bottom'
       ? -Math.abs(this.ballVel.y)  // send upward
-      :  Math.abs(this.ballVel.y); // send downward
+      : Math.abs(this.ballVel.y); // send downward
 
     // Angle based on where the ball hit relative to paddle centre.
     // offset is –1 (far left) to +1 (far right).
@@ -335,7 +381,7 @@ class BallCrushRoom {
   }
 
   // ── Point scored ────────────────────────────────────────────────────────
-  onPoint(scorer) {
+  async onPoint(scorer) {
     const loser = scorer === 'bottom' ? 'top' : 'bottom';
     this.health[loser] = Math.max(0, this.health[loser] - 1);
 
@@ -347,7 +393,7 @@ class BallCrushRoom {
     });
 
     if (this.health[loser] === 0) {
-      this.endGame(scorer);
+      await this.endGame(scorer);
       return;
     }
 
@@ -355,22 +401,7 @@ class BallCrushRoom {
     this.resetBall(loser);
   }
 
-  // ── Game over ───────────────────────────────────────────────────────────
-  endGame(winnerRole) {
-    this.active = false;
-    if (this.intervalId) { clearInterval(this.intervalId); this.intervalId = null; }
 
-    const winner = this.players.find(p => p.role === winnerRole);
-    io.to(this.roomId).emit('gameOver', {
-      winnerRole,
-      winnerUsername: winner ? winner.username : 'Unknown',
-    });
-
-    console.log(`🏆 [BallCrush] ${this.roomId} game over — winner: ${winnerRole}`);
-
-    // Clean up after 30 s so disconnected clients still get the event
-    setTimeout(() => ballCrushRooms.delete(this.roomId), 30_000);
-  }
 
   // ── Broadcast state to both players with perspective flip ───────────────
   //
@@ -393,16 +424,16 @@ class BallCrushRoom {
         socket.emit('gameState', {
           ball: { x: ball.x, y: ball.y },
           paddles: { my: paddleX.bottom, opponent: paddleX.top },
-          health:  { my: health.bottom,  opponent: health.top  },
-          score:   { my: score.bottom,   opponent: score.top   },
+          health: { my: health.bottom, opponent: health.top },
+          score: { my: score.bottom, opponent: score.top },
         });
       } else {
         // Flip Y for top player so their paddle always appears near y=550
         socket.emit('gameState', {
           ball: { x: ball.x, y: BC.HEIGHT - ball.y },
-          paddles: { my: paddleX.top,    opponent: paddleX.bottom },
-          health:  { my: health.top,     opponent: health.bottom  },
-          score:   { my: score.top,      opponent: score.bottom   },
+          paddles: { my: paddleX.top, opponent: paddleX.bottom },
+          health: { my: health.top, opponent: health.bottom },
+          score: { my: score.top, opponent: score.bottom },
         });
       }
     });
@@ -430,6 +461,23 @@ class BallCrushRoom {
 
 const ballCrushRooms = new Map(); // roomId → BallCrushRoom
 
+
+const PING_INTERVAL_MS = 5000;
+const PING_WARNING_MS = 200;
+const pendingPings = new Map(); // socketId → { sentAt, roomId }
+
+setInterval(() => {
+  for (const [, room] of ballCrushRooms) {
+    if (!room.active) continue;
+    for (const { socketId } of room.players) {
+      const s = io.sockets.sockets.get(socketId);
+      if (!s) continue;
+      pendingPings.set(socketId, { sentAt: Date.now(), roomId: room.roomId });
+      s.emit('ping_check');
+    }
+  }
+}, PING_INTERVAL_MS);
+
 // ── Helper: get or create a Ball Crush room ───────────────────────────────
 function getBallCrushRoom(roomId) {
   if (!ballCrushRooms.has(roomId)) {
@@ -448,6 +496,20 @@ io.on('connection', (socket) => {
   // ──────────────────────────────────────────────────────────────────────
   // CHECKERS events
   // ──────────────────────────────────────────────────────────────────────
+
+  // Latency measurement — client echoes back immediately
+  socket.on('pong_check', () => {
+    const entry = pendingPings.get(socket.id);
+    if (!entry) return;
+    const rtt = Date.now() - entry.sentAt;
+    pendingPings.delete(socket.id);
+    if (rtt > PING_WARNING_MS) {
+      console.warn(`⚠️  [Ping] ${socket.id} RTT=${rtt}ms (room=${entry.roomId})`);
+      io.to(entry.roomId).emit('pingWarning', { socketId: socket.id, rtt });
+    }
+  });
+
+
 
   socket.on('joinGame', (data) => {
     const { roomId, color, isHost } = data;
@@ -489,7 +551,7 @@ io.on('connection', (socket) => {
     if (!room || !room.board) { socket.emit('moveRejected', { message: 'Game not found' }); return; }
 
     const validation = isValidMove(room.board, move.fromRow, move.fromCol, move.toRow, move.toCol, move.playerColor);
-    if (!validation.valid)             { socket.emit('moveRejected', { message: 'Invalid move' });   return; }
+    if (!validation.valid) { socket.emit('moveRejected', { message: 'Invalid move' }); return; }
     if (room.currentPlayer !== move.playerColor) { socket.emit('moveRejected', { message: 'Not your turn' }); return; }
 
     const result = applyMove(room.board, move.fromRow, move.fromCol, move.toRow, move.toCol);
@@ -501,11 +563,11 @@ io.on('connection', (socket) => {
 
     const moveData = {
       fromRow: move.fromRow, fromCol: move.fromCol,
-      toRow:   move.toRow,   toCol:   move.toCol,
+      toRow: move.toRow, toCol: move.toCol,
       capturedPiece: result.capturedPiece,
-      promoted:      result.promoted,
-      playerColor:   move.playerColor,
-      newBoard:      room.board,
+      promoted: result.promoted,
+      playerColor: move.playerColor,
+      newBoard: room.board,
       currentPlayer: room.currentPlayer,
     };
 
@@ -513,12 +575,12 @@ io.on('connection', (socket) => {
     for (let r = 0; r < 8; r++)
       for (let c = 0; c < 8; c++) {
         const p = room.board[r][c];
-        if (p?.includes('red'))   red++;
+        if (p?.includes('red')) red++;
         if (p?.includes('black')) black++;
       }
 
-    if (red === 0)   { io.to(roomId).emit('gameOver', { winner: 'black', message: 'Black wins!' }); }
-    else if (black === 0) { io.to(roomId).emit('gameOver', { winner: 'red',   message: 'Red wins!'   }); }
+    if (red === 0) { io.to(roomId).emit('gameOver', { winner: 'black', message: 'Black wins!' }); }
+    else if (black === 0) { io.to(roomId).emit('gameOver', { winner: 'red', message: 'Red wins!' }); }
     else {
       io.to(roomId).emit('opponentMove', moveData);
       socket.emit('moveConfirmed', moveData);
@@ -598,10 +660,13 @@ io.on('connection', (socket) => {
     }
   });
 
+
+
+
   // ──────────────────────────────────────────────────────────────────────
   // Disconnect — clean up both game types
   // ──────────────────────────────────────────────────────────────────────
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('🔌 Client disconnected:', socket.id);
 
     // Checkers cleanup
@@ -616,17 +681,26 @@ io.on('connection', (socket) => {
     }
 
     // Ball Crush cleanup
+    // Ball Crush cleanup
     for (const [roomId, room] of ballCrushRooms.entries()) {
       const idx = room.players.findIndex(p => p.socketId === socket.id);
       if (idx !== -1) {
         const disconnectedPlayer = room.players[idx];
         console.log(`⚠️  [BallCrush] ${disconnectedPlayer.username} disconnected from ${roomId}`);
 
-        room.stop();
-        socket.to(roomId).emit('opponentDisconnected');
+        if (room.active) {
+          const survivorIdx = idx === 0 ? 1 : 0;
+          const survivor = room.players[survivorIdx];
+          if (survivor) {
+            // ✅ Just call endGame — it handles the emit AND the prize
+            await room.endGame(survivor.role);
+          }
+        } else {
+          socket.to(roomId).emit('opponentDisconnected');
+        }
 
+        room.stop();
         ballCrushRooms.delete(roomId);
-        console.log(`🗑️  [BallCrush] Room ${roomId} deleted`);
         break;
       }
     }
@@ -637,8 +711,8 @@ io.on('connection', (socket) => {
 // SECTION 4 – PAYMENT ROUTES (unchanged from original)
 // ============================================================
 
-const Stripe  = require('stripe');
-const paypal  = require('@paypal/checkout-server-sdk');
+const Stripe = require('stripe');
+const paypal = require('@paypal/checkout-server-sdk');
 const { Paynow } = require('paynow');
 
 function getStripe() {
@@ -650,7 +724,7 @@ function getPaynow() {
   if (!process.env.PAYNOW_INTEGRATION_ID || !process.env.PAYNOW_INTEGRATION_KEY)
     throw new Error('PAYNOW credentials not set');
   const pn = new Paynow(process.env.PAYNOW_INTEGRATION_ID, process.env.PAYNOW_INTEGRATION_KEY);
-  const backendUrl  = process.env.SERVER_URL || 'https://game-server-xvdu.onrender.com';
+  const backendUrl = process.env.SERVER_URL || 'https://game-server-xvdu.onrender.com';
   const frontendUrl = process.env.REACT_APP_FRONTEND_URL || 'https://wintapgames.com';
   pn.resultUrl = `${backendUrl}/api/paynow/callback`;
   pn.returnUrl = `${frontendUrl}/wallet?status=returned`;
@@ -674,13 +748,13 @@ async function finalizePayment(userId, {
   const db = admin.database();
 
   if (plan === 'wallet_deposit') {
-    const walletRef  = db.ref(`wallets/${userId}`);
+    const walletRef = db.ref(`wallets/${userId}`);
     const walletSnap = await walletRef.once('value');
     const wallet = walletSnap.val() || {
       balance: 0, totalDeposited: 0, totalWithdrawn: 0,
       totalWon: 0, totalLost: 0, totalBonus: 0, currency: 'USD', isActive: true,
     };
-    const newBalance       = (wallet.balance       || 0) + amount;
+    const newBalance = (wallet.balance || 0) + amount;
     const newTotalDeposited = (wallet.totalDeposited || 0) + amount;
     await walletRef.update({ balance: newBalance, totalDeposited: newTotalDeposited, lastUpdated: new Date().toISOString(), isActive: true });
     const txRef = db.ref(`transactions/${userId}`).push();
@@ -700,10 +774,10 @@ async function finalizePayment(userId, {
     plan, billingCycle, paymentStatus: 'active',
     lastPaymentDate: timestamp, updatedAt: timestamp, failedPaymentAttempts: 0,
   };
-  if (stripeCustomerId)       updateData.stripeCustomerId       = stripeCustomerId;
-  if (stripePaymentMethodId)  updateData.stripePaymentMethodId  = stripePaymentMethodId;
-  if (cardLast4)  updateData.cardLast4  = cardLast4;
-  if (cardBrand)  updateData.cardBrand  = cardBrand;
+  if (stripeCustomerId) updateData.stripeCustomerId = stripeCustomerId;
+  if (stripePaymentMethodId) updateData.stripePaymentMethodId = stripePaymentMethodId;
+  if (cardLast4) updateData.cardLast4 = cardLast4;
+  if (cardBrand) updateData.cardBrand = cardBrand;
   if (cardExpiry) updateData.cardExpiry = cardExpiry;
 
   await db.ref(`users/${userId}`).update(updateData);
@@ -716,7 +790,7 @@ async function finalizePayment(userId, {
 }
 
 async function getOrCreateStripeCustomer(stripe, userId, email) {
-  const snap     = await admin.database().ref(`users/${userId}`).once('value');
+  const snap = await admin.database().ref(`users/${userId}`).once('value');
   const existing = (snap.val() || {}).stripeCustomerId;
   if (existing) return existing;
   const customer = await stripe.customers.create({ email, metadata: { userId } });
@@ -750,7 +824,7 @@ function registerPaymentRoutes(app) {
       if (amount === undefined || !plan || !email || !userId)
         return res.json({ success: false, error: 'Missing required fields' });
 
-      const stripe     = getStripe();
+      const stripe = getStripe();
       const customerId = await getOrCreateStripeCustomer(stripe, userId, email);
 
       if (Number(amount) === 0) {
@@ -778,8 +852,8 @@ function registerPaymentRoutes(app) {
       const stripe = getStripe();
       let customerId = null;
       if (setupIntentId) { const si = await stripe.setupIntents.retrieve(setupIntentId); customerId = si.customer || null; }
-      if (!customerId)   { const snap = await admin.database().ref(`users/${userId}`).once('value'); customerId = (snap.val() || {}).stripeCustomerId || null; }
-      if (!customerId)   return res.json({ success: false, error: 'No Stripe customer found. Please refresh and retry.' });
+      if (!customerId) { const snap = await admin.database().ref(`users/${userId}`).once('value'); customerId = (snap.val() || {}).stripeCustomerId || null; }
+      if (!customerId) return res.json({ success: false, error: 'No Stripe customer found. Please refresh and retry.' });
 
       await attachAndDefaultPM(stripe, customerId, paymentMethodId);
       const cardDetails = await getCardDetails(stripe, paymentMethodId);
@@ -821,8 +895,8 @@ function registerPaymentRoutes(app) {
       if (!paymentMethodId || !userId || amount === undefined)
         return res.json({ success: false, error: 'Missing required fields' });
 
-      const stripe   = getStripe();
-      const snap     = await admin.database().ref(`users/${userId}`).once('value');
+      const stripe = getStripe();
+      const snap = await admin.database().ref(`users/${userId}`).once('value');
       const userData = snap.val();
       if (!userData) return res.json({ success: false, error: 'User not found' });
 
@@ -859,7 +933,7 @@ function registerPaymentRoutes(app) {
   app.post('/api/stripe/webhook',
     require('express').raw({ type: 'application/json' }),
     async (req, res) => {
-      const sig           = req.headers['stripe-signature'];
+      const sig = req.headers['stripe-signature'];
       const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
       let event;
       try { event = getStripe().webhooks.constructEvent(req.body, sig, webhookSecret); }
@@ -892,20 +966,20 @@ function registerPaymentRoutes(app) {
       const { amount, email, phone, plan, billingCycle, userId, method } = req.body;
       if (!amount || !userId) return res.json({ success: false, error: 'amount and userId are required' });
 
-      const isTest   = (process.env.PAYMENT_GATEWAY || 'test') === 'test';
-      const pn       = getPaynow();
+      const isTest = (process.env.PAYMENT_GATEWAY || 'test') === 'test';
+      const pn = getPaynow();
       const reference = `${plan === 'wallet_deposit' ? 'wallet' : 'zimchat'}_${userId}_${Date.now()}`;
-      const payEmail  = isTest ? (process.env.PAYMENT_GATEWAY_TEST_EMAIL || 'wintapgames@gmail.com') : (email || 'customer@example.com');
+      const payEmail = isTest ? (process.env.PAYMENT_GATEWAY_TEST_EMAIL || 'wintapgames@gmail.com') : (email || 'theorg.thone.com');
 
       const payment = pn.createPayment(reference, payEmail);
-      const label   = plan === 'wallet_deposit' ? 'Wallet Deposit' : `ZimChat ${plan} Plan (${billingCycle})`;
+      const label = plan === 'wallet_deposit' ? 'Wallet Deposit' : `ZimChat ${plan} Plan (${billingCycle})`;
       payment.add(label, parseFloat(amount));
 
       let response;
-      if (isTest)                  response = await pn.send(payment);
-      else if (method === 'ecocash')  { if (!phone) return res.json({ success: false, error: 'Phone number required for EcoCash' });   response = await pn.sendMobile(payment, phone, 'ecocash'); }
-      else if (method === 'innbucks') { if (!phone) return res.json({ success: false, error: 'Phone number required for InnBucks' });  response = await pn.sendMobile(payment, phone, 'innbucks'); }
-      else                         response = await pn.send(payment);
+      if (isTest) response = await pn.send(payment);
+      else if (method === 'ecocash') { if (!phone) return res.json({ success: false, error: 'Phone number required for EcoCash' }); response = await pn.sendMobile(payment, phone, 'ecocash'); }
+      else if (method === 'innbucks') { if (!phone) return res.json({ success: false, error: 'Phone number required for InnBucks' }); response = await pn.sendMobile(payment, phone, 'innbucks'); }
+      else response = await pn.send(payment);
 
       if (!response.success) {
         console.error('Paynow full response:', JSON.stringify(response, null, 2));
@@ -924,13 +998,13 @@ function registerPaymentRoutes(app) {
   app.post('/api/paynow/callback', async (req, res) => {
     console.log('🔔 Paynow callback:', JSON.stringify(req.body));
     try {
-      const pn      = getPaynow();
+      const pn = getPaynow();
       const isValid = pn.verifyPayment(req.body);
       if (!isValid) return res.status(400).send('Invalid signature');
 
       const { reference, status, paynowreference, amount } = req.body;
       if (status && ['paid', 'awaiting delivery'].includes(status.toLowerCase())) {
-        const snap    = await admin.database().ref(`pendingPayments/${reference}`).once('value');
+        const snap = await admin.database().ref(`pendingPayments/${reference}`).once('value');
         const pending = snap.val();
         if (pending?.userId && !pending.processed) {
           await admin.database().ref(`pendingPayments/${reference}`).update({ processed: true });
@@ -947,15 +1021,15 @@ function registerPaymentRoutes(app) {
       const { pollUrl, userId, plan, billingCycle, amount, reference } = req.query;
       if (!pollUrl) return res.json({ success: false, error: 'pollUrl required' });
 
-      const pn     = getPaynow();
+      const pn = getPaynow();
       const status = await pn.pollTransaction(pollUrl);
       const isPaid = typeof status.paid === 'function' ? status.paid() : status.status === 'paid';
 
       if (isPaid && userId) {
         const pendingSnap = await admin.database().ref(`pendingPayments/${reference}`).once('value');
-        const pending     = pendingSnap.val();
+        const pending = pendingSnap.val();
         const paymentSnap = await admin.database().ref(`payments/${reference}`).once('value');
-        const payment     = paymentSnap.val();
+        const payment = paymentSnap.val();
         const alreadyDone = payment?.status === 'completed' || pending?.processed === true;
 
         if (!alreadyDone) {
@@ -971,7 +1045,7 @@ function registerPaymentRoutes(app) {
   app.post('/api/paypal/create-order', async (req, res) => {
     try {
       const { amount, plan, billingCycle, email, userId } = req.body;
-      const client  = getPayPalClient();
+      const client = getPayPalClient();
       const request = new paypal.orders.OrdersCreateRequest();
       request.prefer('return=representation');
       request.requestBody({
@@ -987,18 +1061,18 @@ function registerPaymentRoutes(app) {
   app.post('/api/paypal/capture-order', async (req, res) => {
     try {
       const { orderId, plan, billingCycle, userId } = req.body;
-      const client  = getPayPalClient();
+      const client = getPayPalClient();
       const request = new paypal.orders.OrdersCaptureRequest(orderId);
       request.requestBody({});
       const capture = await client.execute(request);
-      const result  = capture.result;
+      const result = capture.result;
       if (result.status !== 'COMPLETED') return res.json({ success: false, error: `PayPal status: ${result.status}` });
 
-      const pu             = result.purchase_units[0];
-      const amount         = parseFloat(pu.payments.captures[0].amount.value);
-      const transactionId  = pu.payments.captures[0].id;
-      let resolvedUserId   = userId;
-      if (!resolvedUserId && pu.custom_id) { try { resolvedUserId = JSON.parse(pu.custom_id).userId; } catch (_) {} }
+      const pu = result.purchase_units[0];
+      const amount = parseFloat(pu.payments.captures[0].amount.value);
+      const transactionId = pu.payments.captures[0].id;
+      let resolvedUserId = userId;
+      if (!resolvedUserId && pu.custom_id) { try { resolvedUserId = JSON.parse(pu.custom_id).userId; } catch (_) { } }
 
       await finalizePayment(resolvedUserId, { amount, plan, billingCycle, paymentMethod: 'paypal', transactionId });
       res.json({ success: true, transactionId });
@@ -1013,7 +1087,7 @@ function registerPaymentRoutes(app) {
       if (!user) return res.json({ success: false, error: 'User not found' });
       await admin.database().ref(`users/${userId}`).update({ cancelAtPeriodEnd: true, cancelledAt: Date.now(), subscriptionStatus: 'cancelling' });
       const lastPaymentDate = user.lastPaymentDate || user.createdAt;
-      const daysInCycle     = user.billingCycle === 'monthly' ? 30 : 365;
+      const daysInCycle = user.billingCycle === 'monthly' ? 30 : 365;
       res.json({ success: true, endDate: lastPaymentDate + (daysInCycle * 24 * 60 * 60 * 1000) });
     } catch (err) { console.error('Cancel subscription error:', err.message); res.json({ success: false, error: err.message }); }
   });
@@ -1028,25 +1102,25 @@ function registerPaymentRoutes(app) {
 
   app.get('/api/debug/user-stripe/:userId', async (req, res) => {
     const snap = await admin.database().ref(`users/${req.params.userId}`).once('value');
-    const u    = snap.val();
+    const u = snap.val();
     if (!u) return res.json({ error: 'User not found' });
     res.json({
       userId: req.params.userId,
-      stripeCustomerId:       u.stripeCustomerId       || '❌ MISSING',
-      stripePaymentMethodId:  u.stripePaymentMethodId  || '❌ MISSING',
-      cardLast4:  u.cardLast4  || '❌ MISSING',
-      cardBrand:  u.cardBrand  || '❌ MISSING',
+      stripeCustomerId: u.stripeCustomerId || '❌ MISSING',
+      stripePaymentMethodId: u.stripePaymentMethodId || '❌ MISSING',
+      cardLast4: u.cardLast4 || '❌ MISSING',
+      cardBrand: u.cardBrand || '❌ MISSING',
       cardExpiry: u.cardExpiry || '❌ MISSING',
-      plan:          u.plan,
+      plan: u.plan,
       paymentStatus: u.paymentStatus,
     });
   });
 
   app.post('/api/admin/backfill-stripe-customers', async (req, res) => {
-    const stripe    = getStripe();
+    const stripe = getStripe();
     const usersSnap = await admin.database().ref('users').once('value');
-    const users     = usersSnap.val() || {};
-    const results   = { fixed: [], skipped: [], errors: [] };
+    const users = usersSnap.val() || {};
+    const results = { fixed: [], skipped: [], errors: [] };
 
     for (const [userId, u] of Object.entries(users)) {
       if (u.stripeCustomerId) { results.skipped.push(userId); continue; }
