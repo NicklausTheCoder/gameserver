@@ -1,9 +1,10 @@
 // ============================================================
 // simple-server.js  –  Game Server
 // Handles:
-//   1. Checkers (existing logic – unchanged)
+//   1. Checkers (Socket.IO game room — board state in memory)
 //   2. Ball Crush (full server-side game loop + matchmaking)
-//   3. Payment routes (Stripe, PayNow, PayPal – unchanged)
+//   3. Checkers matchmaking (Socket.IO queue)
+//   4. Payment routes (Stripe, PayNow, PayPal – unchanged)
 // ============================================================
 
 require('dotenv').config();
@@ -39,10 +40,9 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================================
-// SECTION 1 – CHECKERS (unchanged)
+// SECTION 1 – CHECKERS HELPERS (used by both old socket route
+//             and new CheckersRoom class)
 // ============================================================
-
-const checkersRooms = new Map();
 
 function isValidMove(board, fromRow, fromCol, toRow, toCol, playerColor) {
   const piece = board[fromRow][fromCol];
@@ -107,13 +107,171 @@ function applyMove(board, fromRow, fromCol, toRow, toCol) {
   return { newBoard, capturedPiece, promoted };
 }
 
+function initCheckersBoard() {
+  const board = Array(8).fill(null).map(() => Array(8).fill(null));
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      if ((row + col) % 2 === 1) {
+        if (row < 3) board[row][col] = 'black';
+        else if (row > 4) board[row][col] = 'red';
+      }
+    }
+  }
+  return board;
+}
+
+function checkCheckersWin(board) {
+  let red = 0, black = 0;
+  for (let r = 0; r < 8; r++)
+    for (let c = 0; c < 8; c++) {
+      const p = board[r][c];
+      if (p && p.includes('red')) red++;
+      if (p && p.includes('black')) black++;
+    }
+  if (red === 0) return 'black';
+  if (black === 0) return 'red';
+  return null;
+}
+
 // ============================================================
-// SECTION 2 – BALL CRUSH MATCHMAKING
+// SECTION 2 – CHECKERS GAME ROOM (Socket.IO — board in memory)
 // ============================================================
 //
-// In-memory queue — uid → entry object.
-// Node.js is single-threaded so tryMatch() is inherently atomic.
-// No Firebase transactions, no distributed locks, no race conditions.
+// Board state lives here. Firebase is only written on:
+//   1. Game over (winner + timestamp)
+//   2. Disconnect win
+//   3. Inactivity loss
+// No Firebase reads/writes happen per move.
+
+const checkersGameRooms = new Map(); // roomId → CheckersGameRoom
+
+class CheckersGameRoom {
+  constructor(roomId) {
+    this.roomId = roomId;
+    this.players = []; // [{ socketId, uid, username, color }]
+    this.board = initCheckersBoard();
+    this.currentColor = 'red'; // red always goes first
+    this.active = false;
+    this.createdAt = Date.now();
+  }
+
+  addPlayer(socketId, uid, username, color) {
+    // Prevent duplicate joins
+    if (this.players.find(p => p.uid === uid)) {
+      // Update socket ID in case of reconnect
+      const existing = this.players.find(p => p.uid === uid);
+      existing.socketId = socketId;
+      console.log(`♟️ [Checkers] ${username} reconnected to ${this.roomId}`);
+      return 'reconnected';
+    }
+    if (this.players.length >= 2) return 'full';
+    this.players.push({ socketId, uid, username, color });
+    console.log(`♟️ [Checkers] ${username} (${color}) joined ${this.roomId} [${this.players.length}/2]`);
+    if (this.players.length === 2) this.active = true;
+    return 'joined';
+  }
+
+  handleMove(socketId, move) {
+    const player = this.players.find(p => p.socketId === socketId);
+    if (!player) return { ok: false, reason: 'Player not found' };
+    if (!this.active) return { ok: false, reason: 'Game not active' };
+    if (player.color !== this.currentColor) return { ok: false, reason: 'Not your turn' };
+
+    const validation = isValidMove(
+      this.board,
+      move.fromRow, move.fromCol,
+      move.toRow, move.toCol,
+      player.color
+    );
+
+    if (!validation.valid) return { ok: false, reason: 'Invalid move' };
+
+    const result = applyMove(this.board, move.fromRow, move.fromCol, move.toRow, move.toCol);
+    this.board = result.newBoard;
+    this.currentColor = this.currentColor === 'red' ? 'black' : 'red';
+
+    const winColor = checkCheckersWin(this.board);
+    const winner = winColor ? this.players.find(p => p.color === winColor) : null;
+
+    return {
+      ok: true,
+      capturedPiece: result.capturedPiece,
+      promoted: result.promoted,
+      newCurrentColor: this.currentColor,
+      winner: winner || null,
+    };
+  }
+
+  getOpponent(socketId) {
+    return this.players.find(p => p.socketId !== socketId) || null;
+  }
+
+  getPlayerByUid(uid) {
+    return this.players.find(p => p.uid === uid) || null;
+  }
+
+  async endAndPersist(winnerUid, reason) {
+    this.active = false;
+    try {
+      const db = admin.database();
+
+      // Update Firebase: game result
+      await db.ref(`games/checkers/${this.roomId}`).update({
+        winner: winnerUid,
+        finishedAt: Date.now(),
+        winReason: reason || 'normal',
+        board: this.board,
+        currentPlayer: this.currentColor,
+      });
+
+      // Update lobby status
+      await db.ref(`lobbies/${this.roomId}`).update({
+        status: 'finished',
+        winner: winnerUid,
+        finishedAt: Date.now(),
+      });
+
+      // Award winnings
+      if (winnerUid && reason !== 'resign') {
+        const winningsRef = db.ref(`winningsBalance/${winnerUid}`);
+        const snap = await winningsRef.once('value');
+        const current = snap.exists() ? (snap.val().balance || 0) : 0;
+        await winningsRef.update({
+          balance: current + 2.00,
+          lastUpdated: new Date().toISOString(),
+        });
+        await db.ref(`winnings/${winnerUid}/${this.roomId}`).set({
+          amount: 2.00,
+          game: 'checkers',
+          lobbyId: this.roomId,
+          awardedAt: new Date().toISOString(),
+        });
+        console.log(`💰 [Checkers] $2.00 awarded to ${winnerUid}`);
+      }
+
+      console.log(`🏆 [Checkers] ${this.roomId} ended — winner: ${winnerUid} (${reason})`);
+    } catch (err) {
+      console.error('❌ [Checkers] Failed to persist game end:', err);
+    }
+
+    setTimeout(() => checkersGameRooms.delete(this.roomId), 30_000);
+  }
+}
+
+// Stale room cleanup — rooms older than 1 hour with no active players
+setInterval(() => {
+  const now = Date.now();
+  for (const [roomId, room] of checkersGameRooms.entries()) {
+    if (!room.active && (now - room.createdAt) > 60 * 60 * 1000) {
+      console.log(`🧹 [Checkers] Removing stale game room: ${roomId}`);
+      checkersGameRooms.delete(roomId);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// ============================================================
+// SECTION 3 – BALL CRUSH MATCHMAKING (unchanged)
+// ============================================================
 
 const matchmakingQueue = new Map();
 
@@ -124,7 +282,6 @@ function tryMatch() {
   const p1 = sorted[0];
   const p2 = sorted[1];
 
-  // Remove both BEFORE any async work — atomic in Node's event loop
   matchmakingQueue.delete(p1.uid);
   matchmakingQueue.delete(p2.uid);
 
@@ -142,7 +299,6 @@ function tryMatch() {
 
       console.log(`📨 [Matchmaking] matchFound sent — lobbyId=${lobbyId}`);
 
-      // If one socket dropped between queue join and match, re-queue the survivor
       if (s1 && !s2) {
         console.log(`⚠️  [Matchmaking] ${p2.uid} gone — re-queuing ${p1.uid}`);
         matchmakingQueue.set(p1.uid, { ...p1, joinedAt: Date.now() });
@@ -195,7 +351,6 @@ async function createBallCrushLobbyInFirebase(lobbyId, p1, p2) {
   console.log(`🏰 [Matchmaking] Lobby written to Firebase: ${lobbyId}`);
 }
 
-// Stale-entry cleanup — catches sockets that dropped without a clean disconnect
 setInterval(() => {
   const now = Date.now();
   for (const [uid, entry] of matchmakingQueue.entries()) {
@@ -212,7 +367,7 @@ setInterval(() => {
 }, 15_000);
 
 // ============================================================
-// SECTION 3 – BALL CRUSH GAME ROOM
+// SECTION 4 – BALL CRUSH GAME ROOM (unchanged)
 // ============================================================
 
 const BC = {
@@ -244,11 +399,10 @@ class BallCrushRoom {
     this.hitCount = 0;
     this.pauseTicksLeft = 0;
     this._pendingServe = null;
-    this.hitCooldown = 0;       // NEW — ticks before same paddle can be hit again
-    this.processingPoint = false; // NEW — prevents double-fire during async onPoint
+    this.hitCooldown = 0;
+    this.processingPoint = false;
     this.resetBall('bottom');
   }
-
 
   static get RESET_PAUSE_TICKS() { return 45; }
 
@@ -257,7 +411,7 @@ class BallCrushRoom {
     this.ballVel = { x: 0, y: 0 };
     this._pendingServe = serveToward;
     this.pauseTicksLeft = BallCrushRoom.RESET_PAUSE_TICKS;
-    this.hitCooldown = 0;  // NEW — clear cooldown on each new serve
+    this.hitCooldown = 0;
 
     this.players.forEach(({ socketId }) => {
       const s = io.sockets.sockets.get(socketId);
@@ -314,7 +468,6 @@ class BallCrushRoom {
           awardedAt: new Date().toISOString(),
         });
 
-        // Also update the lobby status in Firebase
         await db.ref(`lobbies/${this.roomId}`).update({
           status: 'finished',
           finishedAt: Date.now(),
@@ -346,19 +499,13 @@ class BallCrushRoom {
       return;
     }
 
-    // Don't run physics while onPoint() is awaiting async work
     if (this.processingPoint) return;
 
-    // Count down the per-paddle hit cooldown
     if (this.hitCooldown > 0) this.hitCooldown--;
 
     const vel = this.ballVel;
     const dist = Math.sqrt(vel.x ** 2 + vel.y ** 2);
 
-    // FIX: step size is now HALF the ball radius (was full radius).
-    // At BALL_RADIUS=18, old max step = 18px. New max step = 9px.
-    // This doubles sub-steps at any given speed, preventing the ball
-    // jumping clean through a paddle in a single sub-step.
     const stepSize = BC.BALL_RADIUS * 0.5;
     const steps = Math.min(BC.MAX_SUBSTEPS, Math.ceil(dist / stepSize));
     const dx = vel.x / steps;
@@ -368,7 +515,6 @@ class BallCrushRoom {
       this.ball.x += dx;
       this.ball.y += dy;
 
-      // Wall bounces
       if (this.ball.x - BC.BALL_RADIUS <= 0) {
         this.ball.x = BC.BALL_RADIUS;
         vel.x = Math.abs(vel.x);
@@ -377,19 +523,17 @@ class BallCrushRoom {
         vel.x = -Math.abs(vel.x);
       }
 
-      // Bottom paddle — only when moving down AND cooldown expired
       if (
         vel.y > 0 &&
         this.hitCooldown === 0 &&
         this.ballOverlapsPaddle(this.ball.x, this.ball.y, this.paddleX.bottom, BC.BOTTOM_PADDLE_Y)
       ) {
         this.ball.y = BC.BOTTOM_PADDLE_Y - BC.PADDLE_HALF_H - BC.BALL_RADIUS;
-        this.hitCooldown = 2; // immune for 2 ticks (~66ms) — prevents ghost double-bounce
+        this.hitCooldown = 2;
         this.onPaddleHit('bottom');
         return;
       }
 
-      // Top paddle — only when moving up AND cooldown expired
       if (
         vel.y < 0 &&
         this.hitCooldown === 0 &&
@@ -405,7 +549,6 @@ class BallCrushRoom {
       if (this.ball.y - BC.BALL_RADIUS <= 0) { this.onPoint('bottom'); return; }
     }
   }
-
 
   onPaddleHit(role) {
     this.hitCount++;
@@ -441,8 +584,6 @@ class BallCrushRoom {
   }
 
   async onPoint(scorer) {
-    // Guard prevents a second tick firing onPoint again before
-    // the first one's async Firebase work completes (~5-50ms).
     if (this.processingPoint) return;
     this.processingPoint = true;
 
@@ -465,6 +606,7 @@ class BallCrushRoom {
     this.resetBall(loser);
     this.processingPoint = false;
   }
+
   broadcastState() {
     const { ball, paddleX, health, score } = this;
 
@@ -524,6 +666,17 @@ setInterval(() => {
       s.emit('ping_check');
     }
   }
+
+  // Also ping checkers players for latency display
+  for (const [, room] of checkersGameRooms) {
+    if (!room.active) continue;
+    for (const { socketId } of room.players) {
+      const s = io.sockets.sockets.get(socketId);
+      if (!s) continue;
+      pendingPings.set(socketId, { sentAt: Date.now(), roomId: room.roomId });
+      s.emit('ping_check');
+    }
+  }
 }, PING_INTERVAL_MS);
 
 function getBallCrushRoom(roomId) {
@@ -534,11 +687,281 @@ function getBallCrushRoom(roomId) {
 }
 
 // ============================================================
-// SECTION 4 – SOCKET.IO EVENT HANDLERS
+// SECTION 5 – CHECKERS MATCHMAKING (unchanged from original)
+// ============================================================
+
+const checkersQueue = new Map();
+
+function tryCheckersMatch() {
+  if (checkersQueue.size < 2) return;
+
+  const sorted = [...checkersQueue.values()].sort((a, b) => a.joinedAt - b.joinedAt);
+  const p1 = sorted[0];
+  const p2 = sorted[1];
+
+  checkersQueue.delete(p1.uid);
+  checkersQueue.delete(p2.uid);
+
+  console.log(`✅ [Checkers] Matched: ${p1.username} vs ${p2.username}`);
+
+  const lobbyId = `checkers_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+  createCheckersLobbyInFirebase(lobbyId, p1, p2)
+    .then(() => {
+      const s1 = io.sockets.sockets.get(p1.socketId);
+      const s2 = io.sockets.sockets.get(p2.socketId);
+
+      if (s1) s1.emit('checkersMatchFound', { lobbyId, opponentDisplayName: p2.displayName });
+      if (s2) s2.emit('checkersMatchFound', { lobbyId, opponentDisplayName: p1.displayName });
+
+      console.log(`📨 [Checkers] matchFound sent — lobbyId=${lobbyId}`);
+
+      if (s1 && !s2) { checkersQueue.set(p1.uid, { ...p1, joinedAt: Date.now() }); tryCheckersMatch(); }
+      if (s2 && !s1) { checkersQueue.set(p2.uid, { ...p2, joinedAt: Date.now() }); tryCheckersMatch(); }
+    })
+    .catch((err) => {
+      console.error('❌ [Checkers] Lobby creation failed — re-queuing both:', err);
+      checkersQueue.set(p1.uid, p1);
+      checkersQueue.set(p2.uid, p2);
+    });
+}
+
+async function createCheckersLobbyInFirebase(lobbyId, p1, p2) {
+  const db = admin.database();
+
+  await db.ref(`lobbies/${lobbyId}`).set({
+    id: lobbyId,
+    gameId: 'checkers',
+    status: 'waiting',
+    players: {
+      [p1.uid]: {
+        uid: p1.uid, username: p1.username, displayName: p1.displayName,
+        avatar: p1.avatar, isReady: false, color: 'red',
+      },
+      [p2.uid]: {
+        uid: p2.uid, username: p2.username, displayName: p2.displayName,
+        avatar: p2.avatar, isReady: false, color: 'black',
+      },
+    },
+    playerIds: [p1.uid, p2.uid],
+    createdAt: Date.now(),
+    maxPlayers: 2,
+  });
+
+  await Promise.all([
+    db.ref(`online/${p1.uid}`).update({ inQueue: false, inGame: true, lastSeen: Date.now() }),
+    db.ref(`online/${p2.uid}`).update({ inQueue: false, inGame: true, lastSeen: Date.now() }),
+    db.ref(`matches/${p1.uid}`).remove(),
+    db.ref(`matches/${p2.uid}`).remove(),
+  ]);
+
+  console.log(`🏁 [Checkers] Lobby created: ${lobbyId}`);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [uid, entry] of checkersQueue.entries()) {
+    const sock = io.sockets.sockets.get(entry.socketId);
+    const isGone = !sock || !sock.connected;
+    const isExpired = now - entry.joinedAt > 3 * 60_000;
+
+    if (isGone || isExpired) {
+      console.log(`🧹 [Checkers] Removing stale queue entry for ${uid}`);
+      checkersQueue.delete(uid);
+      if (!isGone && isExpired) sock.emit('checkersMatchmakingTimeout');
+    }
+  }
+}, 15_000);
+
+// ============================================================
+// SECTION 6 – SOCKET.IO EVENT HANDLERS
 // ============================================================
 
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
+
+  // ── CHECKERS MATCHMAKING ──────────────────────────────────────────────
+
+  socket.on('joinCheckersMatchmaking', (data) => {
+    const { uid, username, displayName, avatar } = data || {};
+    if (!uid) return;
+
+    console.log(`♟️ [Checkers] ${username} (${uid}) joining queue via ${socket.id}`);
+
+    checkersQueue.set(uid, {
+      socketId: socket.id,
+      uid,
+      username,
+      displayName: displayName || username,
+      avatar: avatar || 'default',
+      joinedAt: Date.now(),
+    });
+
+    socket.emit('checkersMatchmakingJoined', { position: checkersQueue.size });
+    console.log(`📋 [Checkers] Queue size: ${checkersQueue.size}`);
+
+    tryCheckersMatch();
+  });
+
+  socket.on('leaveCheckersMatchmaking', (data) => {
+    const { uid } = data || {};
+    if (uid && checkersQueue.delete(uid)) {
+      console.log(`🚪 [Checkers] ${uid} left queue. Size: ${checkersQueue.size}`);
+    }
+    socket.emit('checkersMatchmakingLeft');
+  });
+
+  // ── CHECKERS GAME ROOM ────────────────────────────────────────────────
+  //
+  // All game events use the "checkers:" namespace prefix to avoid
+  // collisions with the old socket-based checkers (joinGame / makeMove)
+  // which is kept below for backward compatibility.
+
+  socket.on('checkers:joinRoom', (data) => {
+    const { roomId, uid, username, color } = data || {};
+    if (!roomId || !uid) return;
+
+    console.log(`♟️ [Checkers] joinRoom: ${username} (${color}) → ${roomId}`);
+
+    // Get or create the game room
+    if (!checkersGameRooms.has(roomId)) {
+      checkersGameRooms.set(roomId, new CheckersGameRoom(roomId));
+    }
+    const room = checkersGameRooms.get(roomId);
+    const result = room.addPlayer(socket.id, uid, username, color);
+
+    socket.join(roomId);
+
+    if (result === 'full') {
+      socket.emit('checkers:error', { message: 'Room is full' });
+      return;
+    }
+
+    if (result === 'reconnected') {
+      // Send current board state so reconnecting player can resync
+      socket.emit('checkers:boardSync', {
+        board: room.board,
+        currentColor: room.currentColor,
+      });
+      // Tell opponent they're back
+      socket.to(roomId).emit('checkers:opponentReconnected');
+      return;
+    }
+
+    socket.emit('checkers:roomJoined', { color, roomId });
+
+    if (room.players.length === 2) {
+      // Both players are in — start the game
+      const [p1, p2] = room.players;
+      const s1 = io.sockets.sockets.get(p1.socketId);
+      const s2 = io.sockets.sockets.get(p2.socketId);
+
+      if (s1) s1.emit('checkers:gameStart', { opponentName: p2.username, yourColor: p1.color });
+      if (s2) s2.emit('checkers:gameStart', { opponentName: p1.username, yourColor: p2.color });
+
+      console.log(`🎮 [Checkers] ${roomId} — ${p1.username}(red) vs ${p2.username}(black)`);
+    }
+  });
+
+  socket.on('checkers:makeMove', (data) => {
+    const { roomId, move } = data || {};
+    if (!roomId || !move) return;
+
+    const room = checkersGameRooms.get(roomId);
+    if (!room) {
+      socket.emit('checkers:moveRejected', { reason: 'Room not found' });
+      return;
+    }
+
+    const result = room.handleMove(socket.id, move);
+
+    if (!result.ok) {
+      socket.emit('checkers:moveRejected', { reason: result.reason });
+      console.log(`❌ [Checkers] Move rejected for ${socket.id}: ${result.reason}`);
+      return;
+    }
+
+    // Confirm to the mover
+    socket.emit('checkers:moveConfirmed', {
+      newCurrentColor: result.newCurrentColor,
+    });
+
+    // Broadcast move to the opponent
+    socket.to(roomId).emit('checkers:opponentMove', {
+      fromRow: move.fromRow,
+      fromCol: move.fromCol,
+      toRow: move.toRow,
+      toCol: move.toCol,
+      capturedPiece: result.capturedPiece || null,
+      piece: move.piece,
+      timestamp: move.timestamp,
+      playerUid: move.playerUid,
+      isKingPromotion: result.promoted || move.isKingPromotion || false,
+    });
+
+    console.log(`♟️ [Checkers] ${roomId} move: [${move.fromRow},${move.fromCol}]→[${move.toRow},${move.toCol}] | next: ${result.newCurrentColor}`);
+
+    // Handle win detected by server-side board check
+    if (result.winner) {
+      io.to(roomId).emit('checkers:gameOver', {
+        winnerUid: result.winner.uid,
+        reason: 'normal',
+      });
+      room.endAndPersist(result.winner.uid, 'normal');
+    }
+  });
+
+  // Client detected win (backup — server's checkCheckersWin is authoritative,
+  // but accept client declaration as a cross-check)
+  socket.on('checkers:declareWin', (data) => {
+    const { roomId, winnerUid } = data || {};
+    if (!roomId || !winnerUid) return;
+
+    const room = checkersGameRooms.get(roomId);
+    if (!room || !room.active) return;
+
+    // Verify by counting pieces on server board
+    const winColor = checkCheckersWin(room.board);
+    if (!winColor) return; // Server doesn't agree yet — ignore
+
+    const winner = room.getPlayerByUid(winnerUid);
+    if (!winner) return;
+
+    console.log(`🏆 [Checkers] ${roomId} win declared — ${winnerUid}`);
+    io.to(roomId).emit('checkers:gameOver', { winnerUid, reason: 'normal' });
+    room.endAndPersist(winnerUid, 'normal');
+  });
+
+  socket.on('checkers:resign', (data) => {
+    const { roomId, uid } = data || {};
+    if (!roomId || !uid) return;
+
+    const room = checkersGameRooms.get(roomId);
+    if (!room || !room.active) return;
+
+    const resigner = room.getPlayerByUid(uid);
+    const opponent = room.players.find(p => p.uid !== uid);
+    if (!resigner || !opponent) return;
+
+    console.log(`🏳️ [Checkers] ${uid} resigned in ${roomId}`);
+    io.to(roomId).emit('checkers:gameOver', { winnerUid: opponent.uid, reason: 'resign' });
+    room.endAndPersist(opponent.uid, 'resign');
+  });
+
+  socket.on('checkers:inactivity', (data) => {
+    const { roomId, uid } = data || {};
+    if (!roomId || !uid) return;
+
+    const room = checkersGameRooms.get(roomId);
+    if (!room || !room.active) return;
+
+    const opponent = room.players.find(p => p.uid !== uid);
+    if (!opponent) return;
+
+    console.log(`⏰ [Checkers] ${uid} timed out in ${roomId}`);
+    io.to(roomId).emit('checkers:gameOver', { winnerUid: opponent.uid, reason: 'inactivity' });
+    room.endAndPersist(opponent.uid, 'inactivity');
+  });
 
   // ── Ping / latency ──────────────────────────────────────────────────────
   socket.on('pong_check', () => {
@@ -552,7 +975,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── MATCHMAKING ─────────────────────────────────────────────────────────
+  // ── BALL CRUSH MATCHMAKING ─────────────────────────────────────────────
 
   socket.on('joinMatchmaking', (data) => {
     const { uid, username, displayName, avatar } = data || {};
@@ -563,7 +986,6 @@ io.on('connection', (socket) => {
 
     console.log(`🎮 [Matchmaking] ${username} (${uid}) joining queue via socket ${socket.id}`);
 
-    // Idempotent — if already queued, update socketId (handles reconnects)
     matchmakingQueue.set(uid, {
       socketId: socket.id,
       uid,
@@ -587,11 +1009,13 @@ io.on('connection', (socket) => {
     socket.emit('matchmakingLeft');
   });
 
-  // ── CHECKERS ────────────────────────────────────────────────────────────
+  // ── OLD CHECKERS (kept for backward compatibility) ───────────────────────
+  // These handlers used the old Firebase-listener approach. Kept intact so
+  // any older clients still work. New clients use checkers:* events above.
 
   socket.on('joinGame', (data) => {
     const { roomId, color, isHost } = data;
-    console.log('📡 [Checkers] joinGame:', { roomId, color, isHost });
+    console.log('📡 [Checkers-Legacy] joinGame:', { roomId, color, isHost });
 
     if (!checkersRooms.has(roomId)) {
       checkersRooms.set(roomId, {
@@ -616,7 +1040,6 @@ io.on('connection', (socket) => {
     if (room) {
       room.board = board;
       room.currentPlayer = currentPlayer;
-      console.log(`📡 [Checkers] State saved for ${roomId}, turn: ${currentPlayer}`);
     }
   });
 
@@ -719,7 +1142,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     console.log('🔌 Client disconnected:', socket.id);
 
-    // Matchmaking queue cleanup
+    // Ball Crush matchmaking cleanup
     for (const [uid, entry] of matchmakingQueue.entries()) {
       if (entry.socketId === socket.id) {
         matchmakingQueue.delete(uid);
@@ -728,7 +1151,46 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Checkers cleanup
+    // Checkers matchmaking cleanup
+    for (const [uid, entry] of checkersQueue.entries()) {
+      if (entry.socketId === socket.id) {
+        checkersQueue.delete(uid);
+        console.log(`🔌 [Checkers] ${uid} disconnected — removed from queue. Size: ${checkersQueue.size}`);
+        break;
+      }
+    }
+
+    // Checkers game room disconnect
+    for (const [roomId, room] of checkersGameRooms.entries()) {
+      const idx = room.players.findIndex(p => p.socketId === socket.id);
+      if (idx !== -1) {
+        const disconnectedPlayer = room.players[idx];
+        console.log(`⚠️  [Checkers] ${disconnectedPlayer.username} disconnected from ${roomId}`);
+
+        if (room.active) {
+          const opponent = room.players.find(p => p.socketId !== socket.id);
+          if (opponent) {
+            // Give a 10-second grace period before awarding the win
+            setTimeout(async () => {
+              // Re-check: if they reconnected within the grace period, their socket will be updated
+              const currentRoom = checkersGameRooms.get(roomId);
+              if (!currentRoom || !currentRoom.active) return;
+
+              const stillGone = io.sockets.sockets.get(disconnectedPlayer.socketId) === undefined;
+              if (stillGone) {
+                console.log(`🏆 [Checkers] Awarding win to ${opponent.uid} after disconnect grace period`);
+                io.to(roomId).emit('checkers:opponentDisconnected');
+                io.to(roomId).emit('checkers:gameOver', { winnerUid: opponent.uid, reason: 'disconnect' });
+                currentRoom.endAndPersist(opponent.uid, 'disconnect');
+              }
+            }, 10_000);
+          }
+        }
+        break;
+      }
+    }
+
+    // Legacy checkers cleanup
     for (const [roomId, room] of checkersRooms.entries()) {
       const idx = room.players.findIndex(p => p.socketId === socket.id);
       if (idx !== -1) {
@@ -762,8 +1224,11 @@ io.on('connection', (socket) => {
   });
 });
 
+// Legacy checkers rooms map (kept for old joinGame/makeMove clients)
+const checkersRooms = new Map();
+
 // ============================================================
-// SECTION 5 – PAYMENT ROUTES (unchanged)
+// SECTION 7 – PAYMENT ROUTES (unchanged)
 // ============================================================
 
 const Stripe = require('stripe');
@@ -1188,7 +1653,8 @@ registerPaymentRoutes(app);
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🎮 Game server running on port ${PORT}`);
-  console.log(`   Checkers:     joinGame / makeMove`);
-  console.log(`   Ball Crush:   joinRoom / paddleMove`);
-  console.log(`   Matchmaking:  joinMatchmaking / leaveMatchmaking`);
+  console.log(`   Checkers (new):  checkers:joinRoom / checkers:makeMove`);
+  console.log(`   Checkers (old):  joinGame / makeMove`);
+  console.log(`   Ball Crush:      joinRoom / paddleMove`);
+  console.log(`   Matchmaking:     joinMatchmaking / leaveMatchmaking`);
 });
