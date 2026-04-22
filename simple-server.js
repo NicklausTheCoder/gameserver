@@ -2,11 +2,11 @@
 // simple-server.js  –  Game Server
 // Handles:
 //   1. Checkers (existing logic – unchanged)
-//   2. Ball Crush (new – full server-side game loop)
+//   2. Ball Crush (full server-side game loop + matchmaking)
 //   3. Payment routes (Stripe, PayNow, PayPal – unchanged)
 // ============================================================
 
-require('dotenv').config(); // MUST be first line
+require('dotenv').config();
 console.log('Gateway mode:', process.env.PAYMENT_GATEWAY);
 
 // ── Firebase ──────────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ app.get('/health', (req, res) => {
 // SECTION 1 – CHECKERS (unchanged)
 // ============================================================
 
-const checkersRooms = new Map(); // roomId → room object
+const checkersRooms = new Map();
 
 function isValidMove(board, fromRow, fromCol, toRow, toCol, playerColor) {
   const piece = board[fromRow][fromCol];
@@ -108,57 +108,128 @@ function applyMove(board, fromRow, fromCol, toRow, toCol) {
 }
 
 // ============================================================
-// SECTION 2 – BALL CRUSH
+// SECTION 2 – BALL CRUSH MATCHMAKING
 // ============================================================
 //
-// Architecture
-// ────────────
-//  • Each Ball Crush match lives in a BallCrushRoom object.
-//  • The server owns the ball entirely (position, velocity, physics).
-//  • Clients own only their own paddle X position (sent via paddleMove).
-//  • The server broadcasts gameState at ~30 Hz to both players.
-//  • The server decides scores, health, speed bumps, and game-over.
-//
-// Coordinate system (server-side)
-// ────────────────────────────────
-//  360 × 640 canvas. Y increases downward.
-//  bottom player paddle → y = 550  (high Y)
-//  top    player paddle → y = 50   (low Y)
-//  Server stores everything in this "bottom perspective".
-//  broadcastState() flips Y for the top player so both clients
-//  always see their own paddle near y = 550.
-//
-// Collision approach — sweep + depenetration
-// ───────────────────────────────────────────
-//  BUG FIXED #1 — Tunneling:
-//    At high speeds the ball can jump clean through a thin paddle
-//    in one tick. We solve this by sweeping along the ball's path
-//    in small sub-steps (up to MAX_SUBSTEPS per tick) so no step
-//    ever moves the ball more than BALL_RADIUS pixels.
-//
-//  BUG FIXED #2 — Ghost / double bounces:
-//    After a reflection we push the ball to sit flush against the
-//    paddle surface (depenetration). This guarantees the ball is
-//    outside the hitbox before the next tick, so it can never
-//    re-trigger the same paddle on the very next frame.
-//
-// ─────────────────────────────────────────────────────────────
+// In-memory queue — uid → entry object.
+// Node.js is single-threaded so tryMatch() is inherently atomic.
+// No Firebase transactions, no distributed locks, no race conditions.
+
+const matchmakingQueue = new Map();
+
+function tryMatch() {
+  if (matchmakingQueue.size < 2) return;
+
+  const sorted = [...matchmakingQueue.values()].sort((a, b) => a.joinedAt - b.joinedAt);
+  const p1 = sorted[0];
+  const p2 = sorted[1];
+
+  // Remove both BEFORE any async work — atomic in Node's event loop
+  matchmakingQueue.delete(p1.uid);
+  matchmakingQueue.delete(p2.uid);
+
+  console.log(`✅ [Matchmaking] Matched: ${p1.username} vs ${p2.username}`);
+
+  const lobbyId = `ballcrush_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+  createBallCrushLobbyInFirebase(lobbyId, p1, p2)
+    .then(() => {
+      const s1 = io.sockets.sockets.get(p1.socketId);
+      const s2 = io.sockets.sockets.get(p2.socketId);
+
+      if (s1) s1.emit('matchFound', { lobbyId, opponentDisplayName: p2.displayName });
+      if (s2) s2.emit('matchFound', { lobbyId, opponentDisplayName: p1.displayName });
+
+      console.log(`📨 [Matchmaking] matchFound sent — lobbyId=${lobbyId}`);
+
+      // If one socket dropped between queue join and match, re-queue the survivor
+      if (s1 && !s2) {
+        console.log(`⚠️  [Matchmaking] ${p2.uid} gone — re-queuing ${p1.uid}`);
+        matchmakingQueue.set(p1.uid, { ...p1, joinedAt: Date.now() });
+        tryMatch();
+      }
+      if (s2 && !s1) {
+        console.log(`⚠️  [Matchmaking] ${p1.uid} gone — re-queuing ${p2.uid}`);
+        matchmakingQueue.set(p2.uid, { ...p2, joinedAt: Date.now() });
+        tryMatch();
+      }
+    })
+    .catch((err) => {
+      console.error('❌ [Matchmaking] Lobby creation failed — re-queuing both:', err);
+      matchmakingQueue.set(p1.uid, p1);
+      matchmakingQueue.set(p2.uid, p2);
+    });
+}
+
+async function createBallCrushLobbyInFirebase(lobbyId, p1, p2) {
+  const db = admin.database();
+
+  await db.ref(`lobbies/${lobbyId}`).set({
+    id: lobbyId,
+    gameId: 'ball-crush',
+    status: 'waiting',
+    players: {
+      [p1.uid]: {
+        uid: p1.uid, username: p1.username, displayName: p1.displayName,
+        avatar: p1.avatar, health: 5, position: { x: 180, y: 550 },
+        isReady: false, score: 0,
+      },
+      [p2.uid]: {
+        uid: p2.uid, username: p2.username, displayName: p2.displayName,
+        avatar: p2.avatar, health: 5, position: { x: 180, y: 50 },
+        isReady: false, score: 0,
+      },
+    },
+    playerIds: [p1.uid, p2.uid],
+    createdAt: Date.now(),
+    maxPlayers: 2,
+  });
+
+  await Promise.all([
+    db.ref(`online/${p1.uid}`).update({ inQueue: false, inGame: true, lastSeen: Date.now() }),
+    db.ref(`online/${p2.uid}`).update({ inQueue: false, inGame: true, lastSeen: Date.now() }),
+    db.ref(`matches/${p1.uid}`).remove(),
+    db.ref(`matches/${p2.uid}`).remove(),
+  ]);
+
+  console.log(`🏰 [Matchmaking] Lobby written to Firebase: ${lobbyId}`);
+}
+
+// Stale-entry cleanup — catches sockets that dropped without a clean disconnect
+setInterval(() => {
+  const now = Date.now();
+  for (const [uid, entry] of matchmakingQueue.entries()) {
+    const sock = io.sockets.sockets.get(entry.socketId);
+    const isGone = !sock || !sock.connected;
+    const isExpired = now - entry.joinedAt > 3 * 60_000;
+
+    if (isGone || isExpired) {
+      console.log(`🧹 [Matchmaking] Removing stale entry for ${uid} (gone=${isGone} expired=${isExpired})`);
+      matchmakingQueue.delete(uid);
+      if (!isGone && isExpired) sock.emit('matchmakingTimeout');
+    }
+  }
+}, 15_000);
+
+// ============================================================
+// SECTION 3 – BALL CRUSH GAME ROOM
+// ============================================================
 
 const BC = {
   WIDTH: 360,
   HEIGHT: 640,
   BALL_RADIUS: 18,
-  PADDLE_HALF_W: 50,   // half-width  of paddle hitbox  (total = 100 px)
-  PADDLE_HALF_H: 10,   // half-height of paddle hitbox  (total =  20 px)
+  PADDLE_HALF_W: 50,
+  PADDLE_HALF_H: 10,
   BOTTOM_PADDLE_Y: 550,
   TOP_PADDLE_Y: 50,
   INITIAL_SPEED: 9,
-  SPEED_BUMP_EVERY: 5,   // every N paddle hits → speed increase
+  SPEED_BUMP_EVERY: 5,
   SPEED_BUMP_MULT: 1.20,
   MAX_SPEED: 20,
   MAX_HEALTH: 5,
-  TICK_MS: 33,  // ~30 Hz game loop
-  MAX_SUBSTEPS: 8,   // sub-step cap — prevents infinite loops
+  TICK_MS: 33,
+  MAX_SUBSTEPS: 8,
 };
 
 class BallCrushRoom {
@@ -171,36 +242,32 @@ class BallCrushRoom {
     this.health = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
     this.score = { bottom: 0, top: 0 };
     this.hitCount = 0;
-    this.pauseTicksLeft = 0;    // physics freeze countdown after each point
-    this._pendingServe = null; // direction to serve when pause expires
+    this.pauseTicksLeft = 0;
+    this._pendingServe = null;
+    this.hitCooldown = 0;       // NEW — ticks before same paddle can be hit again
+    this.processingPoint = false; // NEW — prevents double-fire during async onPoint
     this.resetBall('bottom');
   }
 
-  // ── How many ticks (~33ms each) to freeze after a point ─────────────────
-  // 45 ticks ≈ 1.5 s — clients snap to centre, flash animation clears.
+
   static get RESET_PAUSE_TICKS() { return 45; }
 
-  // ── Ball reset ───────────────────────────────────────────────────────────
-  // Freezes ball at centre and queues the serve direction.
-  // The actual velocity is applied after RESET_PAUSE_TICKS ticks.
-  // Also emits 'ballReset' so clients SNAP the ball (no lerp) to centre.
   resetBall(serveToward) {
     this.ball = { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 };
     this.ballVel = { x: 0, y: 0 };
     this._pendingServe = serveToward;
     this.pauseTicksLeft = BallCrushRoom.RESET_PAUSE_TICKS;
+    this.hitCooldown = 0;  // NEW — clear cooldown on each new serve
 
-    // Tell every client to snap the ball to centre right now
     this.players.forEach(({ socketId }) => {
       const s = io.sockets.sockets.get(socketId);
       if (s) s.emit('ballReset', { ball: { x: BC.WIDTH / 2, y: BC.HEIGHT / 2 } });
     });
   }
 
-  // ── Apply queued serve velocity once the pause expires ──────────────────
   _launchBall() {
     if (!this._pendingServe) return;
-    const angle = (Math.random() * 60 - 30) * (Math.PI / 180); // ±30°
+    const angle = (Math.random() * 60 - 30) * (Math.PI / 180);
     const dir = this._pendingServe === 'bottom' ? 1 : -1;
     this.ballVel = {
       x: Math.sin(angle) * BC.INITIAL_SPEED,
@@ -209,12 +276,10 @@ class BallCrushRoom {
     this._pendingServe = null;
   }
 
-  // ── Current ball speed (magnitude) ─────────────────────────────────────
   currentSpeed() {
     return Math.sqrt(this.ballVel.x ** 2 + this.ballVel.y ** 2);
   }
 
-  // ── Game over ───────────────────────────────────────────────────────────
   async endGame(winnerRole) {
     this.active = false;
     if (this.intervalId) { clearInterval(this.intervalId); this.intervalId = null; }
@@ -223,11 +288,11 @@ class BallCrushRoom {
     io.to(this.roomId).emit('gameOver', {
       winnerRole,
       winnerUsername: winner ? winner.username : 'Unknown',
+      winnerUid: winner ? winner.uid : '',
     });
 
     console.log(`🏆 [BallCrush] ${this.roomId} game over — winner: ${winnerRole}`);
 
-    // ── Award prize to winner ──────────────────────────────────────────
     if (winner?.uid) {
       try {
         const db = admin.database();
@@ -249,19 +314,22 @@ class BallCrushRoom {
           awardedAt: new Date().toISOString(),
         });
 
+        // Also update the lobby status in Firebase
+        await db.ref(`lobbies/${this.roomId}`).update({
+          status: 'finished',
+          finishedAt: Date.now(),
+          winner: winner.uid,
+        });
+
         console.log(`💰 [BallCrush] Awarded $${prize} to ${winner.username} (${winner.uid})`);
-        console.log(`💰 [BallCrush] New winnings balance for ${winner.username}: $${(current + prize).toFixed(2)}`);
       } catch (err) {
         console.error('❌ [BallCrush] Failed to award prize:', err);
       }
     }
 
-    // Clean up after 30 s
     setTimeout(() => ballCrushRooms.delete(this.roomId), 30_000);
   }
 
-  // ── AABB overlap between ball centre and a paddle ──────────────────────
-  //    Returns true if the ball overlaps the paddle rectangle.
   ballOverlapsPaddle(ballX, ballY, paddleX, paddleY) {
     const dx = Math.abs(ballX - paddleX);
     const dy = Math.abs(ballY - paddleY);
@@ -271,30 +339,36 @@ class BallCrushRoom {
     );
   }
 
-  // ── One physics tick — uses sub-stepping to prevent tunneling ──────────
   tick() {
-    // ── Post-point pause ─────────────────────────────────────────────────
-    // While pauseTicksLeft > 0 the ball stays frozen at centre.
-    // On the tick the pause expires we launch the ball with a fresh angle.
     if (this.pauseTicksLeft > 0) {
       this.pauseTicksLeft--;
       if (this.pauseTicksLeft === 0) this._launchBall();
-      return; // skip all physics this tick
+      return;
     }
 
+    // Don't run physics while onPoint() is awaiting async work
+    if (this.processingPoint) return;
+
+    // Count down the per-paddle hit cooldown
+    if (this.hitCooldown > 0) this.hitCooldown--;
+
     const vel = this.ballVel;
-    const stepSize = BC.BALL_RADIUS;            // max pixels per sub-step
     const dist = Math.sqrt(vel.x ** 2 + vel.y ** 2);
+
+    // FIX: step size is now HALF the ball radius (was full radius).
+    // At BALL_RADIUS=18, old max step = 18px. New max step = 9px.
+    // This doubles sub-steps at any given speed, preventing the ball
+    // jumping clean through a paddle in a single sub-step.
+    const stepSize = BC.BALL_RADIUS * 0.5;
     const steps = Math.min(BC.MAX_SUBSTEPS, Math.ceil(dist / stepSize));
     const dx = vel.x / steps;
     const dy = vel.y / steps;
 
     for (let s = 0; s < steps; s++) {
-      // Advance ball one sub-step
       this.ball.x += dx;
       this.ball.y += dy;
 
-      // ── Left / right wall bounce ─────────────────────────────────────
+      // Wall bounces
       if (this.ball.x - BC.BALL_RADIUS <= 0) {
         this.ball.x = BC.BALL_RADIUS;
         vel.x = Math.abs(vel.x);
@@ -303,85 +377,75 @@ class BallCrushRoom {
         vel.x = -Math.abs(vel.x);
       }
 
-      // ── Bottom paddle — only check when ball is moving downward ──────
-      //    vel.y > 0 means moving toward bottom paddle (high Y).
-      if (vel.y > 0 && this.ballOverlapsPaddle(this.ball.x, this.ball.y, this.paddleX.bottom, BC.BOTTOM_PADDLE_Y)) {
-        // Depenetrate: push ball to sit on top of paddle surface
+      // Bottom paddle — only when moving down AND cooldown expired
+      if (
+        vel.y > 0 &&
+        this.hitCooldown === 0 &&
+        this.ballOverlapsPaddle(this.ball.x, this.ball.y, this.paddleX.bottom, BC.BOTTOM_PADDLE_Y)
+      ) {
         this.ball.y = BC.BOTTOM_PADDLE_Y - BC.PADDLE_HALF_H - BC.BALL_RADIUS;
+        this.hitCooldown = 2; // immune for 2 ticks (~66ms) — prevents ghost double-bounce
         this.onPaddleHit('bottom');
-        return; // done with this tick — ball direction has changed
+        return;
       }
 
-      // ── Top paddle — only check when ball is moving upward ───────────
-      //    vel.y < 0 means moving toward top paddle (low Y).
-      if (vel.y < 0 && this.ballOverlapsPaddle(this.ball.x, this.ball.y, this.paddleX.top, BC.TOP_PADDLE_Y)) {
-        // Depenetrate: push ball to sit below paddle surface
+      // Top paddle — only when moving up AND cooldown expired
+      if (
+        vel.y < 0 &&
+        this.hitCooldown === 0 &&
+        this.ballOverlapsPaddle(this.ball.x, this.ball.y, this.paddleX.top, BC.TOP_PADDLE_Y)
+      ) {
         this.ball.y = BC.TOP_PADDLE_Y + BC.PADDLE_HALF_H + BC.BALL_RADIUS;
+        this.hitCooldown = 2;
         this.onPaddleHit('top');
         return;
       }
 
-      // ── Ball exits bottom edge → top player scores ───────────────────
-      if (this.ball.y + BC.BALL_RADIUS >= BC.HEIGHT) {
-        this.onPoint('top');
-        return;
-      }
-
-      // ── Ball exits top edge → bottom player scores ───────────────────
-      if (this.ball.y - BC.BALL_RADIUS <= 0) {
-        this.onPoint('bottom');
-        return;
-      }
+      if (this.ball.y + BC.BALL_RADIUS >= BC.HEIGHT) { this.onPoint('top'); return; }
+      if (this.ball.y - BC.BALL_RADIUS <= 0) { this.onPoint('bottom'); return; }
     }
   }
 
-  // ── Paddle hit handler ──────────────────────────────────────────────────
-  //    Called AFTER the ball has already been depenetrated (repositioned
-  //    outside the hitbox), so this can never double-fire.
+
   onPaddleHit(role) {
     this.hitCount++;
     this.score[role]++;
 
-    const ball = this.ball;
-
-    // Reflect Y away from the paddle
     this.ballVel.y = role === 'bottom'
-      ? -Math.abs(this.ballVel.y)  // send upward
-      : Math.abs(this.ballVel.y); // send downward
+      ? -Math.abs(this.ballVel.y)
+      : Math.abs(this.ballVel.y);
 
-    // Angle based on where the ball hit relative to paddle centre.
-    // offset is –1 (far left) to +1 (far right).
-    // We clamp it so the ball can never go perfectly horizontal.
     const offset = Math.max(-0.9, Math.min(0.9,
-      (ball.x - this.paddleX[role]) / BC.PADDLE_HALF_W
+      (this.ball.x - this.paddleX[role]) / BC.PADDLE_HALF_W
     ));
     const speed = this.currentSpeed();
     this.ballVel.x = offset * speed * 0.75;
 
-    // Re-normalise so speed stays consistent after angle change
     const newSpeed = this.currentSpeed();
     if (newSpeed > 0) {
       this.ballVel.x = (this.ballVel.x / newSpeed) * speed;
       this.ballVel.y = (this.ballVel.y / newSpeed) * speed;
     }
 
-    // Speed bump every BC.SPEED_BUMP_EVERY hits
     if (this.hitCount % BC.SPEED_BUMP_EVERY === 0) {
-      const current = this.currentSpeed();
-      if (current < BC.MAX_SPEED) {
+      if (this.currentSpeed() < BC.MAX_SPEED) {
         this.ballVel.x *= BC.SPEED_BUMP_MULT;
         this.ballVel.y *= BC.SPEED_BUMP_MULT;
         io.to(this.roomId).emit('speedBump', { multiplier: BC.SPEED_BUMP_MULT });
-        console.log(`⚡ [BallCrush] ${this.roomId} speed bump ×${BC.SPEED_BUMP_MULT} | speed=${this.currentSpeed().toFixed(2)}`);
+        console.log(`⚡ [BallCrush] ${this.roomId} speed bump | speed=${this.currentSpeed().toFixed(2)}`);
       }
     }
 
     io.to(this.roomId).emit('paddleHit', { role, score: this.score[role] });
-    console.log(`🏓 [BallCrush] ${this.roomId} | ${role} hit #${this.hitCount} | score=${this.score[role]}`);
+    console.log(`🏓 [BallCrush] ${this.roomId} | ${role} hit #${this.hitCount}`);
   }
 
-  // ── Point scored ────────────────────────────────────────────────────────
   async onPoint(scorer) {
+    // Guard prevents a second tick firing onPoint again before
+    // the first one's async Firebase work completes (~5-50ms).
+    if (this.processingPoint) return;
+    this.processingPoint = true;
+
     const loser = scorer === 'bottom' ? 'top' : 'bottom';
     this.health[loser] = Math.max(0, this.health[loser] - 1);
 
@@ -394,25 +458,13 @@ class BallCrushRoom {
 
     if (this.health[loser] === 0) {
       await this.endGame(scorer);
+      this.processingPoint = false;
       return;
     }
 
-    // Reset ball, serve toward whoever just lost the point
     this.resetBall(loser);
+    this.processingPoint = false;
   }
-
-
-
-  // ── Broadcast state to both players with perspective flip ───────────────
-  //
-  //  Server always stores everything in "bottom player perspective":
-  //    bottom paddle near y=550, top paddle near y=50, ball y increases downward.
-  //
-  //  The "top" player needs a flipped view:
-  //    • ball.y      → HEIGHT - ball.y
-  //    • paddles.my  → their own (top) paddle x
-  //    • paddles.opp → bottom paddle x
-  //
   broadcastState() {
     const { ball, paddleX, health, score } = this;
 
@@ -428,7 +480,6 @@ class BallCrushRoom {
           score: { my: score.bottom, opponent: score.top },
         });
       } else {
-        // Flip Y for top player so their paddle always appears near y=550
         socket.emit('gameState', {
           ball: { x: ball.x, y: BC.HEIGHT - ball.y },
           paddles: { my: paddleX.top, opponent: paddleX.bottom },
@@ -439,7 +490,6 @@ class BallCrushRoom {
     });
   }
 
-  // ── Start game loop ─────────────────────────────────────────────────────
   start() {
     if (this.active) return;
     this.active = true;
@@ -452,19 +502,17 @@ class BallCrushRoom {
     }, BC.TICK_MS);
   }
 
-  // ── Stop game loop (e.g. on disconnect) ─────────────────────────────────
   stop() {
     this.active = false;
     if (this.intervalId) { clearInterval(this.intervalId); this.intervalId = null; }
   }
 }
 
-const ballCrushRooms = new Map(); // roomId → BallCrushRoom
-
+const ballCrushRooms = new Map();
 
 const PING_INTERVAL_MS = 5000;
 const PING_WARNING_MS = 200;
-const pendingPings = new Map(); // socketId → { sentAt, roomId }
+const pendingPings = new Map();
 
 setInterval(() => {
   for (const [, room] of ballCrushRooms) {
@@ -478,7 +526,6 @@ setInterval(() => {
   }
 }, PING_INTERVAL_MS);
 
-// ── Helper: get or create a Ball Crush room ───────────────────────────────
 function getBallCrushRoom(roomId) {
   if (!ballCrushRooms.has(roomId)) {
     ballCrushRooms.set(roomId, new BallCrushRoom(roomId));
@@ -487,17 +534,13 @@ function getBallCrushRoom(roomId) {
 }
 
 // ============================================================
-// SECTION 3 – SOCKET.IO EVENT HANDLERS
+// SECTION 4 – SOCKET.IO EVENT HANDLERS
 // ============================================================
 
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
 
-  // ──────────────────────────────────────────────────────────────────────
-  // CHECKERS events
-  // ──────────────────────────────────────────────────────────────────────
-
-  // Latency measurement — client echoes back immediately
+  // ── Ping / latency ──────────────────────────────────────────────────────
   socket.on('pong_check', () => {
     const entry = pendingPings.get(socket.id);
     if (!entry) return;
@@ -509,7 +552,42 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── MATCHMAKING ─────────────────────────────────────────────────────────
 
+  socket.on('joinMatchmaking', (data) => {
+    const { uid, username, displayName, avatar } = data || {};
+    if (!uid) {
+      console.warn('⚠️  [Matchmaking] joinMatchmaking received with no uid — ignoring');
+      return;
+    }
+
+    console.log(`🎮 [Matchmaking] ${username} (${uid}) joining queue via socket ${socket.id}`);
+
+    // Idempotent — if already queued, update socketId (handles reconnects)
+    matchmakingQueue.set(uid, {
+      socketId: socket.id,
+      uid,
+      username,
+      displayName: displayName || username,
+      avatar: avatar || 'default',
+      joinedAt: Date.now(),
+    });
+
+    socket.emit('matchmakingJoined', { position: matchmakingQueue.size });
+    console.log(`📋 [Matchmaking] Queue size: ${matchmakingQueue.size}`);
+
+    tryMatch();
+  });
+
+  socket.on('leaveMatchmaking', (data) => {
+    const { uid } = data || {};
+    if (uid && matchmakingQueue.delete(uid)) {
+      console.log(`🚪 [Matchmaking] ${uid} left queue. Size: ${matchmakingQueue.size}`);
+    }
+    socket.emit('matchmakingLeft');
+  });
+
+  // ── CHECKERS ────────────────────────────────────────────────────────────
 
   socket.on('joinGame', (data) => {
     const { roomId, color, isHost } = data;
@@ -524,13 +602,11 @@ io.on('connection', (socket) => {
     const room = checkersRooms.get(roomId);
     room.players.push({ socketId: socket.id, color, isHost });
     socket.join(roomId);
-
     socket.emit('gameJoined', { success: true, gameId: roomId });
 
     if (room.board) {
       socket.emit('gameStateSync', { board: room.board, currentPlayer: room.currentPlayer });
     }
-
     socket.to(roomId).emit('playerJoined', { playerId: socket.id, color });
   });
 
@@ -558,8 +634,6 @@ io.on('connection', (socket) => {
     room.board = result.newBoard;
     room.currentPlayer = room.currentPlayer === 'red' ? 'black' : 'red';
     room.moves.push(move);
-
-    console.log(`♟️  [Checkers] ${roomId}: ${move.playerColor} [${move.fromRow},${move.fromCol}]→[${move.toRow},${move.toCol}]`);
 
     const moveData = {
       fromRow: move.fromRow, fromCol: move.fromCol,
@@ -592,28 +666,19 @@ io.on('connection', (socket) => {
     if (room?.board) socket.emit('gameStateSync', { board: room.board, currentPlayer: room.currentPlayer });
   });
 
-  // ──────────────────────────────────────────────────────────────────────
-  // BALL CRUSH events
-  // ──────────────────────────────────────────────────────────────────────
+  // ── BALL CRUSH GAME ─────────────────────────────────────────────────────
 
-  /**
-   * Client emits:  joinRoom  { roomId, username, uid, role:'bottom'|'top' }
-   * Server emits:  roomJoined  { role }           → back to joining socket only
-   *                gameStart   { opponentName }   → to both sockets when room is full
-   */
   socket.on('joinRoom', (data) => {
     const { roomId, username, uid, role } = data;
     console.log(`📡 [BallCrush] joinRoom: roomId=${roomId} username=${username} role=${role}`);
 
     const room = getBallCrushRoom(roomId);
 
-    // Prevent the same socket joining twice (reconnect guard)
     if (room.players.find(p => p.socketId === socket.id)) {
       console.warn(`⚠️  [BallCrush] ${socket.id} already in ${roomId}`);
       return;
     }
 
-    // Prevent more than 2 players
     if (room.players.length >= 2) {
       socket.emit('error', { message: 'Room is full' });
       return;
@@ -624,50 +689,44 @@ io.on('connection', (socket) => {
     socket.emit('roomJoined', { role });
     console.log(`✅ [BallCrush] ${username} (${role}) joined ${roomId} [${room.players.length}/2]`);
 
-    // Both players present → start
     if (room.players.length === 2) {
       const [p1, p2] = room.players;
-
-      // Tell each player who their opponent is
       const s1 = io.sockets.sockets.get(p1.socketId);
       const s2 = io.sockets.sockets.get(p2.socketId);
       if (s1) s1.emit('gameStart', { opponentName: p2.username });
       if (s2) s2.emit('gameStart', { opponentName: p1.username });
 
       console.log(`🎮 [BallCrush] ${roomId} — starting: ${p1.username}(${p1.role}) vs ${p2.username}(${p2.role})`);
-
-      // Small delay so clients finish rendering before physics starts
       setTimeout(() => room.start(), 1500);
     }
   });
 
-  /**
-   * Client emits:  paddleMove  { x }
-   * Server stores the x value for this socket's role and uses it in the next tick.
-   */
   socket.on('paddleMove', (data) => {
     const { x } = data;
     if (x === undefined) return;
 
-    // Find which Ball Crush room this socket belongs to
     for (const [, room] of ballCrushRooms) {
       const player = room.players.find(p => p.socketId === socket.id);
       if (player) {
-        // Clamp to valid paddle range
         room.paddleX[player.role] = Math.max(35, Math.min(BC.WIDTH - 35, x));
         return;
       }
     }
   });
 
+  // ── DISCONNECT ──────────────────────────────────────────────────────────
 
-
-
-  // ──────────────────────────────────────────────────────────────────────
-  // Disconnect — clean up both game types
-  // ──────────────────────────────────────────────────────────────────────
   socket.on('disconnect', async () => {
     console.log('🔌 Client disconnected:', socket.id);
+
+    // Matchmaking queue cleanup
+    for (const [uid, entry] of matchmakingQueue.entries()) {
+      if (entry.socketId === socket.id) {
+        matchmakingQueue.delete(uid);
+        console.log(`🔌 [Matchmaking] ${uid} disconnected — removed from queue. Size: ${matchmakingQueue.size}`);
+        break;
+      }
+    }
 
     // Checkers cleanup
     for (const [roomId, room] of checkersRooms.entries()) {
@@ -675,13 +734,12 @@ io.on('connection', (socket) => {
       if (idx !== -1) {
         room.players.splice(idx, 1);
         socket.to(roomId).emit('opponentDisconnected');
-        if (room.players.length === 0) { checkersRooms.delete(roomId); console.log(`🗑️  [Checkers] Room ${roomId} deleted`); }
+        if (room.players.length === 0) { checkersRooms.delete(roomId); }
         break;
       }
     }
 
-    // Ball Crush cleanup
-    // Ball Crush cleanup
+    // Ball Crush game room cleanup
     for (const [roomId, room] of ballCrushRooms.entries()) {
       const idx = room.players.findIndex(p => p.socketId === socket.id);
       if (idx !== -1) {
@@ -691,10 +749,7 @@ io.on('connection', (socket) => {
         if (room.active) {
           const survivorIdx = idx === 0 ? 1 : 0;
           const survivor = room.players[survivorIdx];
-          if (survivor) {
-            // ✅ Just call endGame — it handles the emit AND the prize
-            await room.endGame(survivor.role);
-          }
+          if (survivor) await room.endGame(survivor.role);
         } else {
           socket.to(roomId).emit('opponentDisconnected');
         }
@@ -708,7 +763,7 @@ io.on('connection', (socket) => {
 });
 
 // ============================================================
-// SECTION 4 – PAYMENT ROUTES (unchanged from original)
+// SECTION 5 – PAYMENT ROUTES (unchanged)
 // ============================================================
 
 const Stripe = require('stripe');
@@ -817,7 +872,6 @@ async function getCardDetails(stripe, paymentMethodId) {
 }
 
 function registerPaymentRoutes(app) {
-
   app.post('/api/stripe/create-payment-intent', async (req, res) => {
     try {
       const { amount, plan, billingCycle, email, userId } = req.body;
@@ -853,7 +907,7 @@ function registerPaymentRoutes(app) {
       let customerId = null;
       if (setupIntentId) { const si = await stripe.setupIntents.retrieve(setupIntentId); customerId = si.customer || null; }
       if (!customerId) { const snap = await admin.database().ref(`users/${userId}`).once('value'); customerId = (snap.val() || {}).stripeCustomerId || null; }
-      if (!customerId) return res.json({ success: false, error: 'No Stripe customer found. Please refresh and retry.' });
+      if (!customerId) return res.json({ success: false, error: 'No Stripe customer found.' });
 
       await attachAndDefaultPM(stripe, customerId, paymentMethodId);
       const cardDetails = await getCardDetails(stripe, paymentMethodId);
@@ -901,7 +955,7 @@ function registerPaymentRoutes(app) {
       if (!userData) return res.json({ success: false, error: 'User not found' });
 
       const customerId = userData.stripeCustomerId;
-      if (!customerId) return res.json({ success: false, error: 'No Stripe customer on file. Please re-add your card.' });
+      if (!customerId) return res.json({ success: false, error: 'No Stripe customer on file.' });
 
       await attachAndDefaultPM(stripe, customerId, paymentMethodId);
 
@@ -912,19 +966,18 @@ function registerPaymentRoutes(app) {
         metadata: { plan, billingCycle, userId, source: 'saved_card' },
       });
 
-      if (pi.status !== 'succeeded') return res.json({ success: false, error: `Unexpected payment status: ${pi.status}` });
+      if (pi.status !== 'succeeded') return res.json({ success: false, error: `Unexpected status: ${pi.status}` });
 
       await finalizePayment(userId, { amount, plan, billingCycle, paymentMethod: 'stripe_card_saved', transactionId: pi.id, stripeCustomerId: customerId, stripePaymentMethodId: paymentMethodId });
       res.json({ success: true, transactionId: pi.id });
     } catch (err) {
-      console.error('charge-saved-card error:', err.message);
       const friendly = {
-        authentication_required: 'Card requires authentication. Please re-enter your card details.',
-        card_declined: 'Card declined. Please try a different payment method.',
-        insufficient_funds: 'Insufficient funds on card.',
-        expired_card: 'Card has expired. Please update your payment method.',
-        incorrect_cvc: 'Incorrect CVC. Please re-enter your card details.',
-        processing_error: 'Processing error. Please try again shortly.',
+        authentication_required: 'Card requires authentication.',
+        card_declined: 'Card declined.',
+        insufficient_funds: 'Insufficient funds.',
+        expired_card: 'Card has expired.',
+        incorrect_cvc: 'Incorrect CVC.',
+        processing_error: 'Processing error. Please try again.',
       };
       res.json({ success: false, error: friendly[err.code] || err.message });
     }
@@ -934,10 +987,9 @@ function registerPaymentRoutes(app) {
     require('express').raw({ type: 'application/json' }),
     async (req, res) => {
       const sig = req.headers['stripe-signature'];
-      const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
       let event;
-      try { event = getStripe().webhooks.constructEvent(req.body, sig, webhookSecret); }
-      catch (err) { console.error('Stripe webhook sig error:', err.message); return res.status(400).send('Webhook signature error'); }
+      try { event = getStripe().webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET); }
+      catch (err) { return res.status(400).send('Webhook signature error'); }
 
       if (event.type === 'payment_intent.succeeded') {
         const intent = event.data.object;
@@ -945,15 +997,13 @@ function registerPaymentRoutes(app) {
         if (userId) await finalizePayment(userId, { amount: intent.amount / 100, plan, billingCycle, paymentMethod: 'stripe_card', transactionId: intent.id });
       }
       if (event.type === 'payment_intent.payment_failed') {
-        const intent = event.data.object;
-        const { userId } = intent.metadata || {};
+        const { userId } = event.data.object.metadata || {};
         if (userId) {
           const snap = await admin.database().ref(`users/${userId}`).once('value');
           const attempts = ((snap.val() || {}).failedPaymentAttempts || 0) + 1;
           await admin.database().ref(`users/${userId}`).update({ failedPaymentAttempts: attempts });
           if (attempts >= 3) {
             await admin.database().ref(`users/${userId}`).update({ plan: 'free', paymentStatus: 'failed', downgradedAt: Date.now() });
-            console.log(`⚠️  User ${userId} downgraded after 3 failed payments`);
           }
         }
       }
@@ -972,35 +1022,29 @@ function registerPaymentRoutes(app) {
       const payEmail = isTest ? (process.env.PAYMENT_GATEWAY_TEST_EMAIL || 'wintapgames@gmail.com') : (email || 'theorg.thone.com');
 
       const payment = pn.createPayment(reference, payEmail);
-      const label = plan === 'wallet_deposit' ? 'Wallet Deposit' : `ZimChat ${plan} Plan (${billingCycle})`;
-      payment.add(label, parseFloat(amount));
+      payment.add(plan === 'wallet_deposit' ? 'Wallet Deposit' : `ZimChat ${plan} Plan (${billingCycle})`, parseFloat(amount));
 
       let response;
       if (isTest) response = await pn.send(payment);
-      else if (method === 'ecocash') { if (!phone) return res.json({ success: false, error: 'Phone number required for EcoCash' }); response = await pn.sendMobile(payment, phone, 'ecocash'); }
-      else if (method === 'innbucks') { if (!phone) return res.json({ success: false, error: 'Phone number required for InnBucks' }); response = await pn.sendMobile(payment, phone, 'innbucks'); }
+      else if (method === 'ecocash') { if (!phone) return res.json({ success: false, error: 'Phone required' }); response = await pn.sendMobile(payment, phone, 'ecocash'); }
+      else if (method === 'innbucks') { if (!phone) return res.json({ success: false, error: 'Phone required' }); response = await pn.sendMobile(payment, phone, 'innbucks'); }
       else response = await pn.send(payment);
 
-      if (!response.success) {
-        console.error('Paynow full response:', JSON.stringify(response, null, 2));
-        return res.json({ success: false, error: response.errors?.join(', ') || 'PayNow initiation failed' });
-      }
+      if (!response.success) return res.json({ success: false, error: response.errors?.join(', ') || 'PayNow failed' });
 
       await admin.database().ref(`pendingPayments/${reference}`).set({ userId, plan, billingCycle: billingCycle || 'once', amount: parseFloat(amount), pollUrl: response.pollUrl, reference, isTest, createdAt: Date.now(), processed: false });
       await admin.database().ref(`payments/${reference}`).set({ userId, amount: parseFloat(amount), status: 'pending', processingStarted: false, processedBy: null, createdAt: new Date().toISOString() });
       await admin.database().ref(`payment_polls/${reference}`).set({ pollUrl: response.pollUrl, status: 'pending', createdAt: new Date().toISOString() });
 
       if (response.redirectUrl) return res.json({ success: true, redirectUrl: response.redirectUrl, pollUrl: response.pollUrl, reference, isTest });
-      res.json({ success: true, pollUrl: response.pollUrl, reference, isTest, instructions: `Payment prompt of $${amount} sent to ${phone}. Approve on your phone.` });
-    } catch (err) { console.error('Paynow create error:', err.message); res.json({ success: false, error: err.message }); }
+      res.json({ success: true, pollUrl: response.pollUrl, reference, isTest, instructions: `Payment prompt of $${amount} sent to ${phone}.` });
+    } catch (err) { res.json({ success: false, error: err.message }); }
   });
 
   app.post('/api/paynow/callback', async (req, res) => {
-    console.log('🔔 Paynow callback:', JSON.stringify(req.body));
     try {
       const pn = getPaynow();
-      const isValid = pn.verifyPayment(req.body);
-      if (!isValid) return res.status(400).send('Invalid signature');
+      if (!pn.verifyPayment(req.body)) return res.status(400).send('Invalid signature');
 
       const { reference, status, paynowreference, amount } = req.body;
       if (status && ['paid', 'awaiting delivery'].includes(status.toLowerCase())) {
@@ -1013,7 +1057,7 @@ function registerPaymentRoutes(app) {
         }
       }
       res.sendStatus(200);
-    } catch (err) { console.error('Paynow callback error:', err.message); res.sendStatus(500); }
+    } catch (err) { res.sendStatus(500); }
   });
 
   app.get('/api/paynow/poll', async (req, res) => {
@@ -1034,12 +1078,12 @@ function registerPaymentRoutes(app) {
 
         if (!alreadyDone) {
           await admin.database().ref(`payments/${reference}`).update({ processingStarted: true, processingStartedAt: new Date().toISOString() });
-          await finalizePayment(userId, { amount: parseFloat(amount) || (pending?.amount) || 0, plan: plan || pending?.plan || 'wallet_deposit', billingCycle: billingCycle || pending?.billingCycle || 'once', paymentMethod: 'paynow', transactionId: reference || pollUrl });
+          await finalizePayment(userId, { amount: parseFloat(amount) || pending?.amount || 0, plan: plan || pending?.plan || 'wallet_deposit', billingCycle: billingCycle || pending?.billingCycle || 'once', paymentMethod: 'paynow', transactionId: reference || pollUrl });
           if (pending) await admin.database().ref(`pendingPayments/${reference}`).update({ processed: true });
         }
       }
       res.json({ success: true, paid: isPaid, status: status.status || 'pending' });
-    } catch (err) { console.error('Paynow poll error:', err.message); res.json({ success: false, error: err.message, paid: false }); }
+    } catch (err) { res.json({ success: false, error: err.message, paid: false }); }
   });
 
   app.post('/api/paypal/create-order', async (req, res) => {
@@ -1055,7 +1099,7 @@ function registerPaymentRoutes(app) {
       });
       const order = await client.execute(request);
       res.json({ success: true, orderId: order.result.id });
-    } catch (err) { console.error('PayPal create-order error:', err.message); res.json({ success: false, error: err.message }); }
+    } catch (err) { res.json({ success: false, error: err.message }); }
   });
 
   app.post('/api/paypal/capture-order', async (req, res) => {
@@ -1076,7 +1120,7 @@ function registerPaymentRoutes(app) {
 
       await finalizePayment(resolvedUserId, { amount, plan, billingCycle, paymentMethod: 'paypal', transactionId });
       res.json({ success: true, transactionId });
-    } catch (err) { console.error('PayPal capture error:', err.message); res.json({ success: false, error: err.message }); }
+    } catch (err) { res.json({ success: false, error: err.message }); }
   });
 
   app.post('/api/cancel-subscription', async (req, res) => {
@@ -1086,10 +1130,9 @@ function registerPaymentRoutes(app) {
       const user = snap.val();
       if (!user) return res.json({ success: false, error: 'User not found' });
       await admin.database().ref(`users/${userId}`).update({ cancelAtPeriodEnd: true, cancelledAt: Date.now(), subscriptionStatus: 'cancelling' });
-      const lastPaymentDate = user.lastPaymentDate || user.createdAt;
       const daysInCycle = user.billingCycle === 'monthly' ? 30 : 365;
-      res.json({ success: true, endDate: lastPaymentDate + (daysInCycle * 24 * 60 * 60 * 1000) });
-    } catch (err) { console.error('Cancel subscription error:', err.message); res.json({ success: false, error: err.message }); }
+      res.json({ success: true, endDate: (user.lastPaymentDate || user.createdAt) + (daysInCycle * 24 * 60 * 60 * 1000) });
+    } catch (err) { res.json({ success: false, error: err.message }); }
   });
 
   app.post('/api/reactivate-subscription', async (req, res) => {
@@ -1145,6 +1188,7 @@ registerPaymentRoutes(app);
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🎮 Game server running on port ${PORT}`);
-  console.log(`   Checkers:   joinGame / makeMove`);
-  console.log(`   Ball Crush: joinRoom / paddleMove`);
+  console.log(`   Checkers:     joinGame / makeMove`);
+  console.log(`   Ball Crush:   joinRoom / paddleMove`);
+  console.log(`   Matchmaking:  joinMatchmaking / leaveMatchmaking`);
 });
