@@ -24,16 +24,16 @@ function normaliseWallet(raw) {
   }
   return {
     ...raw,
-    balance: typeof raw.balance === 'number' ? raw.balance : 0,
-    totalDeposited: raw.totalDeposited ?? 0,
-    totalWithdrawn: raw.totalWithdrawn ?? 0,
-    totalWon: raw.totalWon ?? 0,
-    totalLost: raw.totalLost ?? 0,
-    totalBonus: raw.totalBonus ?? 0,
-    totalGameFees: raw.totalGameFees ?? 0,
-    totalRefunds: raw.totalRefunds ?? 0,
-    currency: raw.currency ?? 'USD',
-    isActive: raw.isActive ?? true,
+    balance:        typeof raw.balance === 'number' ? raw.balance : 0,
+    totalDeposited: raw.totalDeposited  ?? 0,
+    totalWithdrawn: raw.totalWithdrawn  ?? 0,
+    totalWon:       raw.totalWon        ?? 0,
+    totalLost:      raw.totalLost       ?? 0,
+    totalBonus:     raw.totalBonus      ?? 0,
+    totalGameFees:  raw.totalGameFees   ?? 0,
+    totalRefunds:   raw.totalRefunds    ?? 0,
+    currency:       raw.currency        ?? 'USD',
+    isActive:       raw.isActive        ?? true,
   };
 }
 
@@ -88,7 +88,7 @@ function registerUserRoutes(app) {
         const now = Date.now();
         if (current !== null) {
           const isSameSession = current.sessionId === sessionId;
-          const isStale = (now - (current.lockedAt || 0)) > 10000;
+          const isStale       = (now - (current.lockedAt || 0)) > 10000;
           if (!isSameSession && !isStale) { blocked = true; return undefined; }
         }
         return { sessionId, lockedAt: Date.now(), userAgent: userAgent || 'unknown' };
@@ -167,18 +167,18 @@ function registerUserRoutes(app) {
     }
 
     const deductionTypes = ['game_fee', 'loss', 'withdrawal'];
-    const isDeduction = deductionTypes.includes(type);
-    const magnitude = Math.abs(amount);
+    const isDeduction  = deductionTypes.includes(type);
+    const magnitude    = Math.abs(amount);
     const signedAmount = isDeduction ? -magnitude : magnitude;
 
     console.log(`\n💳 [Transact] UID=${uid} type=${type} amount=${amount} magnitude=${magnitude} isDeduction=${isDeduction}`);
 
     // Determine which path holds the wallet.
     // Primary: wallets/{uid} — Secondary: users/{uid}/wallet (legacy accounts).
-    const primarySnap = await db().ref(`wallets/${uid}`).once('value');
+    const primarySnap   = await db().ref(`wallets/${uid}`).once('value');
     const primaryExists = primarySnap.exists();
-    const primaryVal = primaryExists ? primarySnap.val() : null;
-    const walletPath = primaryExists ? `wallets/${uid}` : `users/${uid}/wallet`;
+    const primaryVal    = primaryExists ? primarySnap.val() : null;
+    const walletPath    = primaryExists ? `wallets/${uid}` : `users/${uid}/wallet`;
 
     console.log(`  📂 wallets/${uid} exists=${primaryExists} raw=${JSON.stringify(primaryVal)}`);
 
@@ -212,13 +212,13 @@ function registerUserRoutes(app) {
       }
 
       switch (type) {
-        case 'win': wallet.totalWon = (wallet.totalWon ?? 0) + magnitude; break;
-        case 'loss': wallet.totalLost = (wallet.totalLost ?? 0) + magnitude; break;
-        case 'deposit': wallet.totalDeposited = (wallet.totalDeposited ?? 0) + magnitude; break;
+        case 'win':        wallet.totalWon       = (wallet.totalWon       ?? 0) + magnitude; break;
+        case 'loss':       wallet.totalLost      = (wallet.totalLost      ?? 0) + magnitude; break;
+        case 'deposit':    wallet.totalDeposited = (wallet.totalDeposited ?? 0) + magnitude; break;
         case 'withdrawal': wallet.totalWithdrawn = (wallet.totalWithdrawn ?? 0) + magnitude; break;
-        case 'bonus': wallet.totalBonus = (wallet.totalBonus ?? 0) + magnitude; break;
-        case 'game_fee': wallet.totalGameFees = (wallet.totalGameFees ?? 0) + magnitude; break;
-        case 'refund': wallet.totalRefunds = (wallet.totalRefunds ?? 0) + magnitude; break;
+        case 'bonus':      wallet.totalBonus     = (wallet.totalBonus     ?? 0) + magnitude; break;
+        case 'game_fee':   wallet.totalGameFees  = (wallet.totalGameFees  ?? 0) + magnitude; break;
+        case 'refund':     wallet.totalRefunds   = (wallet.totalRefunds   ?? 0) + magnitude; break;
       }
 
       wallet.balance = newBalance;
@@ -270,15 +270,15 @@ function registerUserRoutes(app) {
       if (!userSnap.exists()) return res.json({ success: false, error: 'User not found' });
 
       const userData = userSnap.val();
-      const wallet = normaliseWallet(walletSnap.exists() ? walletSnap.val() : null);
+      const wallet   = normaliseWallet(walletSnap.exists() ? walletSnap.val() : null);
 
       // Strip private fields before sending to client
       const safeUser = {
         uid,
-        public: userData.public || {},
+        public:   userData.public   || {},
         wallet,
         metadata: userData.metadata || {},
-        games: userData.games || {},
+        games:    userData.games    || {},
         winnings: userData.winnings || {},
       };
       res.json({ success: true, user: safeUser });
@@ -315,20 +315,20 @@ function registerUserRoutes(app) {
         db().ref(`users/${uid}`).once('value'),
       ]);
 
-      const now = new Date().toISOString();
+      const now  = new Date().toISOString();
       const curr = statsSnap.exists() ? statsSnap.val() : defaultStats();
 
-      const newTotalGames = (curr.totalGames || 0) + 1;
-      const newTotalScore = (curr.totalScore || 0) + score;
+      const newTotalGames   = (curr.totalGames   || 0) + 1;
+      const newTotalScore   = (curr.totalScore   || 0) + score;
       const newAverageScore = Math.floor(newTotalScore / newTotalGames);
-      const newHighScore = Math.max(curr.highScore || 0, score);
-      const newTotalFlaps = (curr.totalFlaps || 0) + (flaps || 0);
-      const newTotalDist = (curr.totalDistance || 0) + (distance || 0);
-      const newWinStreak = won ? (curr.winStreak || 0) + 1 : 0;
-      const newBestStreak = Math.max(curr.bestWinStreak || 0, newWinStreak);
-      const newExp = (curr.experience || 0) + (won ? 15 : 0); // +15 XP only on win
-      const newLevel = calcLevel(newExp);
-      const newRank = calcRank(newLevel);
+      const newHighScore    = Math.max(curr.highScore || 0, score);
+      const newTotalFlaps   = (curr.totalFlaps   || 0) + (flaps    || 0);
+      const newTotalDist    = (curr.totalDistance || 0) + (distance || 0);
+      const newWinStreak    = won ? (curr.winStreak || 0) + 1 : 0;
+      const newBestStreak   = Math.max(curr.bestWinStreak || 0, newWinStreak);
+      const newExp          = (curr.experience   || 0) + (won ? 15 : 0); // +15 XP only on win
+      const newLevel        = calcLevel(newExp);
+      const newRank         = calcRank(newLevel);
 
       const updates = {
         highScore: newHighScore, totalGames: newTotalGames,
@@ -337,10 +337,10 @@ function registerUserRoutes(app) {
         winStreak: newWinStreak, bestWinStreak: newBestStreak,
         experience: newExp, level: newLevel, rank: newRank,
         lastPlayed: now,
-        totalWins: won ? (curr.totalWins || 0) + 1 : (curr.totalWins || 0),
-        totalLosses: won ? (curr.totalLosses || 0) : (curr.totalLosses || 0) + 1,
-        gamesWon: won ? (curr.gamesWon || 0) + 1 : (curr.gamesWon || 0),
-        gamesLost: won ? (curr.gamesLost || 0) : (curr.gamesLost || 0) + 1,
+        totalWins:   won ? (curr.totalWins   || 0) + 1 : (curr.totalWins   || 0),
+        totalLosses: won ? (curr.totalLosses || 0)     : (curr.totalLosses || 0) + 1,
+        gamesWon:    won ? (curr.gamesWon    || 0) + 1 : (curr.gamesWon    || 0),
+        gamesLost:   won ? (curr.gamesLost   || 0)     : (curr.gamesLost   || 0) + 1,
         winRate: newTotalGames > 0
           ? Math.round(((won ? (curr.totalWins || 0) + 1 : (curr.totalWins || 0)) / newTotalGames) * 100)
           : 0,
@@ -380,7 +380,7 @@ function registerUserRoutes(app) {
       await db().ref(`users/${uid}/scores`).push({
         gameId, game: gameId, score, won,
         timestamp: Date.now(), date: now,
-        ...(flaps !== undefined ? { flaps } : {}),
+        ...(flaps    !== undefined ? { flaps }    : {}),
         ...(distance !== undefined ? { distance } : {}),
       });
 
@@ -411,24 +411,24 @@ function registerUserRoutes(app) {
 
       const curr = statsSnap.exists() ? statsSnap.val() : {};
 
-      const newPlayed = (curr.gamesPlayed || 0) + 1;
-      const newPieces = (curr.piecesCaptured || 0) + piecesCaptured;
-      const newKings = (curr.kingsMade || 0) + kingsMade;
-      const newTotalMoves = (curr.totalMoves || 0) + moves;
-      const newAvgMoves = Math.floor(newTotalMoves / newPlayed);
-      const newWon = won ? (curr.gamesWon || 0) + 1 : (curr.gamesWon || 0);
-      const newLost = won ? (curr.gamesLost || 0) : (curr.gamesLost || 0) + 1;
-      const newStreak = won ? (curr.winStreak || 0) + 1 : 0;
-      const newBest = Math.max(curr.bestWinStreak || 0, newStreak);
-      const winRate = Math.round((newWon / newPlayed) * 100);
-      const newExp = (curr.experience || 0) + (won ? 15 : 0); // +15 XP only on win
-      const newLevel = Math.floor(1 + newPlayed / 10);
+      const newPlayed     = (curr.gamesPlayed    || 0) + 1;
+      const newPieces     = (curr.piecesCaptured || 0) + piecesCaptured;
+      const newKings      = (curr.kingsMade      || 0) + kingsMade;
+      const newTotalMoves = (curr.totalMoves     || 0) + moves;
+      const newAvgMoves   = Math.floor(newTotalMoves / newPlayed);
+      const newWon        = won ? (curr.gamesWon  || 0) + 1 : (curr.gamesWon  || 0);
+      const newLost       = won ? (curr.gamesLost || 0)     : (curr.gamesLost || 0) + 1;
+      const newStreak     = won ? (curr.winStreak || 0) + 1 : 0;
+      const newBest       = Math.max(curr.bestWinStreak || 0, newStreak);
+      const winRate       = Math.round((newWon / newPlayed) * 100);
+      const newExp        = (curr.experience || 0) + (won ? 15 : 0); // +15 XP only on win
+      const newLevel      = Math.floor(1 + newPlayed / 10);
 
       let newRank = 'Bronze';
-      if (newWon >= 50 || newPieces >= 500) newRank = 'Diamond';
+      if      (newWon >= 50 || newPieces >= 500) newRank = 'Diamond';
       else if (newWon >= 25 || newPieces >= 250) newRank = 'Platinum';
       else if (newWon >= 10 || newPieces >= 100) newRank = 'Gold';
-      else if (newWon >= 5 || newPieces >= 50) newRank = 'Silver';
+      else if (newWon >= 5  || newPieces >= 50)  newRank = 'Silver';
 
       const updates = {
         gamesPlayed: newPlayed, gamesWon: newWon, gamesLost: newLost,
@@ -516,17 +516,17 @@ function registerUserRoutes(app) {
 
       profSnap.forEach(child => {
         const uid = child.key;
-        const p = child.val();
-        const w = normaliseWallet(wallets[uid] || null);
+        const p   = child.val();
+        const w   = normaliseWallet(wallets[uid] || null);
         entries.push({
           uid,
           displayName: p.displayName || 'Player',
-          rankTier: p.rank || 'Bronze',
-          level: p.level || 1,
-          totalGames: p.totalGames || 0,
-          totalWins: p.totalWins || 0,
-          winRate: p.winRate || 0,
-          totalWon: w.totalWon || 0,
+          rankTier:    p.rank    || 'Bronze',
+          level:       p.level   || 1,
+          totalGames:  p.totalGames || 0,
+          totalWins:   p.totalWins  || 0,
+          winRate:     p.winRate    || 0,
+          totalWon:    w.totalWon   || 0,
         });
       });
 
@@ -623,15 +623,15 @@ function registerUserRoutes(app) {
       const snap = await db().ref(`users/${uid}`).once('value');
       if (!snap.exists()) return res.json({ success: false, error: 'User not found' });
 
-      const userData = snap.val();
-      const currentTotal = userData.winnings?.[game]?.total || 0;
-      const currentCount = userData.winnings?.[game]?.count || 0;
-      const historyEntry = { amount, date: new Date().toISOString(), description, game };
-      const existingHist = userData.winnings?.[game]?.history || [];
+      const userData       = snap.val();
+      const currentTotal   = userData.winnings?.[game]?.total || 0;
+      const currentCount   = userData.winnings?.[game]?.count || 0;
+      const historyEntry   = { amount, date: new Date().toISOString(), description, game };
+      const existingHist   = userData.winnings?.[game]?.history || [];
 
       await db().ref(`users/${uid}`).update({
-        [`winnings/${game}/total`]: currentTotal + amount,
-        [`winnings/${game}/count`]: currentCount + 1,
+        [`winnings/${game}/total`]:   currentTotal + amount,
+        [`winnings/${game}/count`]:   currentCount + 1,
         [`winnings/${game}/lastWin`]: new Date().toISOString(),
         [`winnings/${game}/history`]: [historyEntry, ...existingHist].slice(0, 10),
       });
@@ -668,6 +668,42 @@ function registerUserRoutes(app) {
   // GAME LOGS
   // ══════════════════════════════════════════════════════════════════════════
 
+  // GET /api/lobby/:lobbyId
+  app.get('/api/lobby/:lobbyId', async (req, res) => {
+    try {
+      const { lobbyId } = req.params;
+      const snap = await db().ref(`lobbies/${lobbyId}`).once('value');
+      if (!snap.exists()) return res.status(404).json({ success: false, error: 'Lobby not found' });
+      res.json({ success: true, lobby: { id: lobbyId, ...snap.val() } });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // POST /api/lobby/:lobbyId — create or update lobby
+  app.post('/api/lobby/:lobbyId', async (req, res) => {
+    try {
+      const { lobbyId } = req.params;
+      const data = req.body;
+      await db().ref(`lobbies/${lobbyId}`).set({ ...data, updatedAt: Date.now() });
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // PATCH /api/lobby/:lobbyId — partial update
+  app.patch('/api/lobby/:lobbyId', async (req, res) => {
+    try {
+      const { lobbyId } = req.params;
+      const data = req.body;
+      await db().ref(`lobbies/${lobbyId}`).update({ ...data, updatedAt: Date.now() });
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // POST /api/logs/:lobbyId/:uid
   // body: { logs: [{ message, additionalData, timestamp }] }
   app.post('/api/logs/:lobbyId/:uid', async (req, res) => {
@@ -680,10 +716,10 @@ function registerUserRoutes(app) {
       for (const log of logs) {
         const key = `${log.timestamp || Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
         updates[`game_logs/${lobbyId}/${uid}/${key}`] = {
-          timestamp: log.timestamp || Date.now(),
-          userId: uid,
+          timestamp:      log.timestamp || Date.now(),
+          userId:         uid,
           lobbyId,
-          message: log.message || '',
+          message:        log.message   || '',
           additionalData: log.additionalData ?? null,
         };
       }
@@ -708,7 +744,7 @@ function registerUserRoutes(app) {
       if (keys.length <= keep) return res.json({ success: true, deleted: 0 });
 
       const toDelete = keys.slice(0, keys.length - keep);
-      const deletes = {};
+      const deletes  = {};
       for (const key of toDelete) deletes[`game_logs/${lobbyId}/${uid}/${key}`] = null;
 
       await db().ref().update(deletes);
