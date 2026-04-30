@@ -704,8 +704,107 @@ function registerUserRoutes(app) {
     }
   });
 
+  // PATCH /api/lobby/:lobbyId/player/:uid/ready — set player ready state
+  app.patch('/api/lobby/:lobbyId/player/:uid/ready', async (req, res) => {
+    try {
+      const { lobbyId, uid } = req.params;
+      const { isReady } = req.body;
+
+      const snap = await db().ref(`lobbies/${lobbyId}`).once('value');
+      if (!snap.exists()) return res.status(404).json({ success: false, error: 'Lobby not found' });
+
+      await db().ref(`lobbies/${lobbyId}/players/${uid}/isReady`).set(!!isReady);
+      await db().ref(`lobbies/${lobbyId}`).update({ updatedAt: Date.now() });
+
+      // Check if all players are now ready
+      const lobbySnap = await db().ref(`lobbies/${lobbyId}`).once('value');
+      const lobby = lobbySnap.val();
+      const players = Object.values(lobby.players || {});
+      const allReady = players.length >= 2 && players.every((p) => p.isReady);
+
+      if (allReady && lobby.status === 'waiting') {
+        const now = Date.now();
+        await db().ref(`lobbies/${lobbyId}`).update({
+          status: 'ready',
+          countdownStartedAt: now,
+          updatedAt: now,
+        });
+        console.log('✅ [Lobby] ' + lobbyId + ' — all players ready, countdown started');
+
+        // Auto-transition to playing after 3 seconds (countdown duration)
+        setTimeout(async () => {
+          try {
+            const currentSnap = await db().ref(`lobbies/${lobbyId}/status`).once('value');
+            if (currentSnap.val() === 'ready') {
+              await db().ref(`lobbies/${lobbyId}`).update({
+                status: 'playing',
+                startedAt: Date.now(),
+                updatedAt: Date.now(),
+              });
+              console.log('🎮 [Lobby] ' + lobbyId + ' — auto-started (status → playing)');
+            }
+          } catch (e) {
+            console.error('Auto-start error:', e.message);
+          }
+        }, 3000);
+      }
+
+      res.json({ success: true, allReady });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // PATCH /api/lobby/:lobbyId/start — mark lobby as playing
+  app.patch('/api/lobby/:lobbyId/start', async (req, res) => {
+    try {
+      const { lobbyId } = req.params;
+      await db().ref(`lobbies/${lobbyId}`).update({
+        status: 'playing',
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      console.log('🎮 [Lobby] ' + lobbyId + ' — status → playing');
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // POST /api/logs/:lobbyId/:uid
   // body: { logs: [{ message, additionalData, timestamp }] }
+  // POST /api/online/:uid — set player online status
+  app.post('/api/online/:uid', async (req, res) => {
+    try {
+      const { uid } = req.params;
+      const { isOnline } = req.body;
+      if (!uid) return res.status(400).json({ success: false, error: 'Missing uid' });
+      await db().ref(`online/${uid}`).update({
+        isOnline: !!isOnline,
+        lastSeen: Date.now(),
+      });
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // POST /api/online/:uid/game — set player in-game status
+  app.post('/api/online/:uid/game', async (req, res) => {
+    try {
+      const { uid } = req.params;
+      const { inGame, lobbyId } = req.body;
+      if (!uid) return res.status(400).json({ success: false, error: 'Missing uid' });
+      const update = { inGame: !!inGame, lastSeen: Date.now() };
+      if (lobbyId) update.currentLobbyId = lobbyId;
+      else update.currentLobbyId = null;
+      await db().ref(`online/${uid}`).update(update);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   app.post('/api/logs/:lobbyId/:uid', async (req, res) => {
     try {
       const { lobbyId, uid } = req.params;

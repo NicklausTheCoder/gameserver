@@ -26,69 +26,104 @@ function initCheckersBoard() {
   return board;
 }
 
+// Replace isValidMove entirely
 function isValidMove(board, fromRow, fromCol, toRow, toCol, playerColor) {
   const piece = board[fromRow][fromCol];
   if (!piece || !piece.includes(playerColor)) return { valid: false, capturedPiece: null };
 
-  const isKing = piece.includes('king');
-  const isRed  = piece.includes('red');
+  const isKing  = piece.includes('king');
+  const isRed   = piece.includes('red');
   const rowDiff = toRow - fromRow;
-  const colDiff = Math.abs(toCol - fromCol);
+  const colDiff = toCol - fromCol;
 
-  if (Math.abs(rowDiff) !== colDiff)              return { valid: false, capturedPiece: null };
-  if (!isKing) {
-    if (isRed  && rowDiff >= 0) return { valid: false, capturedPiece: null };
-    if (!isRed && rowDiff <= 0) return { valid: false, capturedPiece: null };
-  }
+  // Must move diagonally
+  if (Math.abs(rowDiff) !== Math.abs(colDiff)) return { valid: false, capturedPiece: null };
+  if (Math.abs(rowDiff) === 0)                 return { valid: false, capturedPiece: null };
+
+  // Destination must be empty
   if (board[toRow][toCol] !== null) return { valid: false, capturedPiece: null };
 
-  let capturedPiece = null;
-  if (Math.abs(rowDiff) > 1) {
-    const rowStep = rowDiff > 0 ? 1 : -1;
-    const colStep = toCol > fromCol ? 1 : -1;
-    let captureCount = 0;
+  const rowStep = rowDiff > 0 ? 1 : -1;
+  const colStep = colDiff > 0 ? 1 : -1;
+
+  if (isKing) {
+    // Flying king: scan every square along the diagonal
+    let capturedPiece = null;
     let r = fromRow + rowStep;
     let c = fromCol + colStep;
+
     while (r !== toRow || c !== toCol) {
       const p = board[r][c];
       if (p) {
-        if (p.includes(isRed ? 'black' : 'red')) { captureCount++; capturedPiece = { row: r, col: c }; }
-        else return { valid: false, capturedPiece: null };
+        if (capturedPiece) return { valid: false, capturedPiece: null }; // two pieces in path
+        if (p.includes(isRed ? 'black' : 'red')) {
+          capturedPiece = { row: r, col: c };
+        } else {
+          return { valid: false, capturedPiece: null }; // own piece in path
+        }
       }
-      r += rowStep; c += colStep;
+      r += rowStep;
+      c += colStep;
     }
-    if (captureCount !== 1) return { valid: false, capturedPiece: null };
+    return { valid: true, capturedPiece };
+
+  } else {
+    // Regular piece: only 1-square move forward, or 2-square capture in any diagonal direction
+    const isCapture = Math.abs(rowDiff) === 2;
+    const isSimple  = Math.abs(rowDiff) === 1;
+
+    if (!isCapture && !isSimple) return { valid: false, capturedPiece: null };
+
+    if (isSimple) {
+      // Must move forward
+      if (isRed  && rowDiff >= 0) return { valid: false, capturedPiece: null };
+      if (!isRed && rowDiff <= 0) return { valid: false, capturedPiece: null };
+      return { valid: true, capturedPiece: null };
+    }
+
+    // Capture: must jump exactly one opponent piece
+    const midR = fromRow + rowStep;
+    const midC = fromCol + colStep;
+    const midP = board[midR][midC];
+    if (!midP)                                    return { valid: false, capturedPiece: null };
+    if (!midP.includes(isRed ? 'black' : 'red')) return { valid: false, capturedPiece: null };
+    return { valid: true, capturedPiece: { row: midR, col: midC } };
   }
-  return { valid: true, capturedPiece };
 }
 
+// Replace applyMove entirely
 function applyMove(board, fromRow, fromCol, toRow, toCol) {
   const newBoard = JSON.parse(JSON.stringify(board));
-  const piece = newBoard[fromRow][fromCol];
-  const rowDiff = toRow - fromRow;
+  const piece    = newBoard[fromRow][fromCol];
+  const isKing   = piece.includes('king');
+  const rowStep  = toRow > fromRow ? 1 : -1;
+  const colStep  = toCol > fromCol ? 1 : -1;
 
-  newBoard[toRow][toCol] = piece;
+  newBoard[toRow][toCol]     = piece;
   newBoard[fromRow][fromCol] = null;
 
+  // Remove any captured piece along the path
   let capturedPiece = null;
-  if (Math.abs(rowDiff) > 1) {
-    const rowStep = rowDiff > 0 ? 1 : -1;
-    const colStep = toCol > fromCol ? 1 : -1;
-    let r = fromRow + rowStep;
-    let c = fromCol + colStep;
-    while (r !== toRow || c !== toCol) {
-      if (newBoard[r][c]) { capturedPiece = { row: r, col: c }; newBoard[r][c] = null; }
-      r += rowStep; c += colStep;
+  let r = fromRow + rowStep;
+  let c = fromCol + colStep;
+  while (r !== toRow || c !== toCol) {
+    if (newBoard[r][c]) {
+      capturedPiece  = { row: r, col: c };
+      newBoard[r][c] = null;
     }
+    r += rowStep;
+    c += colStep;
   }
 
+  // Promotion (regular pieces only — kings stay kings)
   let promoted = false;
-  if (piece === 'red'   && toRow === 0) { newBoard[toRow][toCol] = 'king_red';   promoted = true; }
-  if (piece === 'black' && toRow === 7) { newBoard[toRow][toCol] = 'king_black'; promoted = true; }
+  if (!isKing) {
+    if (piece === 'red'   && toRow === 0) { newBoard[toRow][toCol] = 'king_red';   promoted = true; }
+    if (piece === 'black' && toRow === 7) { newBoard[toRow][toCol] = 'king_black'; promoted = true; }
+  }
 
   return { newBoard, capturedPiece, promoted };
 }
-
 function checkCheckersWin(board) {
   let red = 0, black = 0;
   for (let r = 0; r < 8; r++)
@@ -156,6 +191,7 @@ class CheckersGameRoom {
       promoted:        result.promoted,
       newCurrentColor: this.currentColor,
       winner:          winner || null,
+      board:           this.board,  // ← always return authoritative board
     };
   }
 
@@ -247,6 +283,13 @@ function registerCheckersHandlers(io, socket) {
       if (s1) s1.emit('checkers:gameStart', { opponentName: p2.username, yourColor: p1.color });
       if (s2) s2.emit('checkers:gameStart', { opponentName: p1.username, yourColor: p2.color });
       console.log(`🎮 [Checkers] ${roomId} — ${p1.username}(red) vs ${p2.username}(black)`);
+
+      // ── FIX: Send authoritative board to BOTH players so they start in sync ──
+      io.to(roomId).emit('checkers:boardSync', {
+        board:        room.board,
+        currentColor: room.currentColor,
+      });
+      console.log(`🔄 [Checkers] ${roomId} — boardSync sent to both players`);
     }
   });
 
@@ -259,12 +302,18 @@ function registerCheckersHandlers(io, socket) {
 
     const result = room.handleMove(socket.id, move);
     if (!result.ok) {
-      socket.emit('checkers:moveRejected', { reason: result.reason });
+      // ── FIX: Send board on rejection so desynced client can resync ──
+      socket.emit('checkers:moveRejected', { reason: result.reason, board: room.board });
       console.log(`❌ [Checkers] Move rejected: ${result.reason}`);
       return;
     }
 
-    socket.emit('checkers:moveConfirmed', { newCurrentColor: result.newCurrentColor });
+    // ── FIX: Include authoritative board in confirmation to prevent desync ──
+    socket.emit('checkers:moveConfirmed', {
+      newCurrentColor: result.newCurrentColor,
+      board:           result.board,
+    });
+
     socket.to(roomId).emit('checkers:opponentMove', {
       fromRow: move.fromRow, fromCol: move.fromCol,
       toRow:   move.toRow,   toCol:   move.toCol,
@@ -273,6 +322,8 @@ function registerCheckersHandlers(io, socket) {
       timestamp:       move.timestamp,
       playerUid:       move.playerUid,
       isKingPromotion: result.promoted || move.isKingPromotion || false,
+      board:           result.board,         // ← authoritative board for opponent to resync
+      newCurrentColor: result.newCurrentColor,
     });
 
     console.log(`♟️ [Checkers] ${roomId} [${move.fromRow},${move.fromCol}]→[${move.toRow},${move.toCol}] | next: ${result.newCurrentColor}`);
@@ -370,8 +421,8 @@ function registerCheckersHandlers(io, socket) {
     for (let r = 0; r < 8; r++)
       for (let c = 0; c < 8; c++) {
         const p = room.board[r][c];
-        if (p?.includes('red'))   red++;
-        if (p?.includes('black')) black++;
+        if (p && p.includes('red'))   red++;
+        if (p && p.includes('black')) black++;
       }
 
     if (red   === 0) io.to(roomId).emit('gameOver', { winner: 'black', message: 'Black wins!' });
@@ -381,7 +432,7 @@ function registerCheckersHandlers(io, socket) {
 
   socket.on('requestGameState', (data) => {
     const room = checkersRooms.get(data.roomId);
-    if (room?.board) socket.emit('gameStateSync', { board: room.board, currentPlayer: room.currentPlayer });
+    if (room && room.board) socket.emit('gameStateSync', { board: room.board, currentPlayer: room.currentPlayer });
   });
 }
 
@@ -401,7 +452,6 @@ function handleCheckersDisconnect(io, socket) {
           setTimeout(async () => {
             const currentRoom = checkersGameRooms.get(roomId);
             if (!currentRoom || !currentRoom.active) return;
-            // If socket still shows as gone after grace period, award the win
             const stillGone = !io.sockets.sockets.get(disconnectedPlayer.socketId);
             if (stillGone) {
               console.log(`🏆 [Checkers] Awarding win to ${opponent.uid} after disconnect`);
