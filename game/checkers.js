@@ -184,11 +184,11 @@ class CheckersGameRoom {
         const winningsRef = db.ref(`winningsBalance/${winnerUid}`);
         const snap        = await winningsRef.once('value');
         const current     = snap.exists() ? (snap.val().balance || 0) : 0;
-        await winningsRef.update({ balance: current + 2.00, lastUpdated: new Date().toISOString() });
+        await winningsRef.update({ balance: current + 1.50, lastUpdated: new Date().toISOString() });
         await db.ref(`winnings/${winnerUid}/${this.roomId}`).set({
-          amount: 2.00, game: 'checkers', lobbyId: this.roomId, awardedAt: new Date().toISOString(),
+          amount: 1.50, game: 'checkers', lobbyId: this.roomId, awardedAt: new Date().toISOString(),
         });
-        console.log(`💰 [Checkers] $2.00 awarded to ${winnerUid}`);
+        console.log(`💰 [Checkers] $1.50 awarded to ${winnerUid}`);
       }
 
       console.log(`🏆 [Checkers] ${this.roomId} ended — winner: ${winnerUid} (${reason})`);
