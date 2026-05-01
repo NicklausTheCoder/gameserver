@@ -26,104 +26,71 @@ function initCheckersBoard() {
   return board;
 }
 
-// Replace isValidMove entirely
 function isValidMove(board, fromRow, fromCol, toRow, toCol, playerColor) {
   const piece = board[fromRow][fromCol];
   if (!piece || !piece.includes(playerColor)) return { valid: false, capturedPiece: null };
 
-  const isKing  = piece.includes('king');
-  const isRed   = piece.includes('red');
+  const isKing = piece.includes('king');
+  const isRed  = piece.includes('red');
   const rowDiff = toRow - fromRow;
-  const colDiff = toCol - fromCol;
+  const colDiff = Math.abs(toCol - fromCol);
+  const isCapture = Math.abs(rowDiff) > 1;
 
-  // Must move diagonally
-  if (Math.abs(rowDiff) !== Math.abs(colDiff)) return { valid: false, capturedPiece: null };
-  if (Math.abs(rowDiff) === 0)                 return { valid: false, capturedPiece: null };
-
-  // Destination must be empty
+  if (Math.abs(rowDiff) !== colDiff)              return { valid: false, capturedPiece: null };
+  if (!isKing && !isCapture) {
+    // Regular (non-capture) moves must go in the correct forward direction
+    if (isRed  && rowDiff >= 0) return { valid: false, capturedPiece: null };
+    if (!isRed && rowDiff <= 0) return { valid: false, capturedPiece: null };
+  }
   if (board[toRow][toCol] !== null) return { valid: false, capturedPiece: null };
 
-  const rowStep = rowDiff > 0 ? 1 : -1;
-  const colStep = colDiff > 0 ? 1 : -1;
-
-  if (isKing) {
-    // Flying king: scan every square along the diagonal
-    let capturedPiece = null;
+  let capturedPiece = null;
+  if (Math.abs(rowDiff) > 1) {
+    const rowStep = rowDiff > 0 ? 1 : -1;
+    const colStep = toCol > fromCol ? 1 : -1;
+    let captureCount = 0;
     let r = fromRow + rowStep;
     let c = fromCol + colStep;
-
     while (r !== toRow || c !== toCol) {
       const p = board[r][c];
       if (p) {
-        if (capturedPiece) return { valid: false, capturedPiece: null }; // two pieces in path
-        if (p.includes(isRed ? 'black' : 'red')) {
-          capturedPiece = { row: r, col: c };
-        } else {
-          return { valid: false, capturedPiece: null }; // own piece in path
-        }
+        if (p.includes(isRed ? 'black' : 'red')) { captureCount++; capturedPiece = { row: r, col: c }; }
+        else return { valid: false, capturedPiece: null };
       }
-      r += rowStep;
-      c += colStep;
+      r += rowStep; c += colStep;
     }
-    return { valid: true, capturedPiece };
-
-  } else {
-    // Regular piece: only 1-square move forward, or 2-square capture in any diagonal direction
-    const isCapture = Math.abs(rowDiff) === 2;
-    const isSimple  = Math.abs(rowDiff) === 1;
-
-    if (!isCapture && !isSimple) return { valid: false, capturedPiece: null };
-
-    if (isSimple) {
-      // Must move forward
-      if (isRed  && rowDiff >= 0) return { valid: false, capturedPiece: null };
-      if (!isRed && rowDiff <= 0) return { valid: false, capturedPiece: null };
-      return { valid: true, capturedPiece: null };
-    }
-
-    // Capture: must jump exactly one opponent piece
-    const midR = fromRow + rowStep;
-    const midC = fromCol + colStep;
-    const midP = board[midR][midC];
-    if (!midP)                                    return { valid: false, capturedPiece: null };
-    if (!midP.includes(isRed ? 'black' : 'red')) return { valid: false, capturedPiece: null };
-    return { valid: true, capturedPiece: { row: midR, col: midC } };
+    if (captureCount !== 1) return { valid: false, capturedPiece: null };
   }
+  return { valid: true, capturedPiece };
 }
 
-// Replace applyMove entirely
 function applyMove(board, fromRow, fromCol, toRow, toCol) {
   const newBoard = JSON.parse(JSON.stringify(board));
-  const piece    = newBoard[fromRow][fromCol];
-  const isKing   = piece.includes('king');
-  const rowStep  = toRow > fromRow ? 1 : -1;
-  const colStep  = toCol > fromCol ? 1 : -1;
+  const piece = newBoard[fromRow][fromCol];
+  const rowDiff = toRow - fromRow;
 
-  newBoard[toRow][toCol]     = piece;
+  newBoard[toRow][toCol] = piece;
   newBoard[fromRow][fromCol] = null;
 
-  // Remove any captured piece along the path
   let capturedPiece = null;
-  let r = fromRow + rowStep;
-  let c = fromCol + colStep;
-  while (r !== toRow || c !== toCol) {
-    if (newBoard[r][c]) {
-      capturedPiece  = { row: r, col: c };
-      newBoard[r][c] = null;
+  if (Math.abs(rowDiff) > 1) {
+    const rowStep = rowDiff > 0 ? 1 : -1;
+    const colStep = toCol > fromCol ? 1 : -1;
+    let r = fromRow + rowStep;
+    let c = fromCol + colStep;
+    while (r !== toRow || c !== toCol) {
+      if (newBoard[r][c]) { capturedPiece = { row: r, col: c }; newBoard[r][c] = null; }
+      r += rowStep; c += colStep;
     }
-    r += rowStep;
-    c += colStep;
   }
 
-  // Promotion (regular pieces only — kings stay kings)
   let promoted = false;
-  if (!isKing) {
-    if (piece === 'red'   && toRow === 0) { newBoard[toRow][toCol] = 'king_red';   promoted = true; }
-    if (piece === 'black' && toRow === 7) { newBoard[toRow][toCol] = 'king_black'; promoted = true; }
-  }
+  if (piece === 'red'   && toRow === 0) { newBoard[toRow][toCol] = 'king_red';   promoted = true; }
+  if (piece === 'black' && toRow === 7) { newBoard[toRow][toCol] = 'king_black'; promoted = true; }
 
   return { newBoard, capturedPiece, promoted };
 }
+
 function checkCheckersWin(board) {
   let red = 0, black = 0;
   for (let r = 0; r < 8; r++)
@@ -147,6 +114,7 @@ class CheckersGameRoom {
     this.currentColor = 'red'; // red always goes first
     this.active       = false;
     this.createdAt    = Date.now();
+    this.drawOfferedBy = null; // uid of player who offered a draw
   }
 
   addPlayer(socketId, uid, username, color) {
@@ -370,6 +338,76 @@ function registerCheckersHandlers(io, socket) {
     console.log(`⏰ [Checkers] ${uid} timed out in ${roomId}`);
     io.to(roomId).emit('checkers:gameOver', { winnerUid: opponent.uid, reason: 'inactivity' });
     room.endAndPersist(opponent.uid, 'inactivity');
+  });
+
+  socket.on('checkers:offerDraw', (data) => {
+    const { roomId, uid } = data || {};
+    if (!roomId || !uid) return;
+    const room = checkersGameRooms.get(roomId);
+    if (!room || !room.active) return;
+    room.drawOfferedBy = uid;
+    // Forward the offer to the opponent
+    const opponent = room.players.find(p => p.uid !== uid);
+    if (!opponent) return;
+    const oppSocket = io.sockets.sockets.get(opponent.socketId);
+    if (oppSocket) oppSocket.emit('checkers:drawOffer');
+    console.log(`🤝 [Checkers] ${uid} offered draw in ${roomId}`);
+  });
+
+  socket.on('checkers:respondDraw', (data) => {
+    const { roomId, uid, accept } = data || {};
+    if (!roomId || !uid) return;
+    const room = checkersGameRooms.get(roomId);
+    if (!room || !room.active) return;
+
+    if (!accept) {
+      room.drawOfferedBy = null;
+      // Tell the offerer their draw was declined
+      const offerer = room.players.find(p => p.uid !== uid);
+      if (offerer) {
+        const offSocket = io.sockets.sockets.get(offerer.socketId);
+        if (offSocket) offSocket.emit('checkers:drawDeclined');
+      }
+      console.log(`❌ [Checkers] Draw declined in ${roomId}`);
+      return;
+    }
+
+    // Accepted — end as draw
+    room.drawOfferedBy = null;
+    room.active = false;
+    io.to(roomId).emit('checkers:draw');
+    console.log(`🤝 [Checkers] Draw agreed in ${roomId}`);
+
+    // Persist draw — no winnings awarded
+    try {
+      const db = admin.database();
+      db.ref(`games/checkers/${roomId}`).update({ winner: 'draw', finishedAt: Date.now(), winReason: 'draw' });
+      db.ref(`lobbies/${roomId}`).update({ status: 'finished', winner: 'draw', finishedAt: Date.now() });
+    } catch (err) {
+      console.error('❌ [Checkers] Failed to persist draw:', err);
+    }
+    setTimeout(() => checkersGameRooms.delete(roomId), 30_000);
+  });
+
+  socket.on('checkers:report', async (data) => {
+    const { roomId, reporterUid, reportedUid, reason } = data || {};
+    if (!roomId || !reporterUid || !reason) return;
+    console.log(`🚩 [Checkers] Report in ${roomId}: ${reporterUid} reported ${reportedUid} — "${reason}"`);
+    try {
+      const db = admin.database();
+      const reportKey = `${Date.now()}_${reporterUid.slice(0,6)}`;
+      await db.ref(`reports/checkers/${roomId}/${reportKey}`).set({
+        reporterUid,
+        reportedUid:  reportedUid || null,
+        reason,
+        roomId,
+        timestamp:    new Date().toISOString(),
+      });
+      // Ack back to reporter
+      socket.emit('checkers:reportAck');
+    } catch (err) {
+      console.error('❌ [Checkers] Failed to store report:', err);
+    }
   });
 
   // ── Legacy joinGame / makeMove (kept for old clients) ─────────────────────
