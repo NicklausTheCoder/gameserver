@@ -8,42 +8,82 @@
 const admin = require('firebase-admin');
 
 const matchmakingQueue = new Map(); // uid → queue entry
+let   isMatching       = false;     // mutex — prevents concurrent match attempts
 
 // ── Match logic ───────────────────────────────────────────────────────────────
 
-function tryMatch(io) {
+async function tryMatch(io) {
+  // ── LOCK ────────────────────────────────────────────────────────────────────
+  // Node.js is single-threaded so the synchronous read+delete is atomic,
+  // but the async Firebase write is not. The lock ensures a second caller
+  // waits until the first fully resolves before attempting another match.
+  if (isMatching) return;
   if (matchmakingQueue.size < 2) return;
 
-  const sorted = [...matchmakingQueue.values()].sort((a, b) => a.joinedAt - b.joinedAt);
-  const p1 = sorted[0];
-  const p2 = sorted[1];
+  isMatching = true;
 
-  matchmakingQueue.delete(p1.uid);
-  matchmakingQueue.delete(p2.uid);
+  try {
+    const sorted = [...matchmakingQueue.values()].sort((a, b) => a.joinedAt - b.joinedAt);
+    const p1 = sorted[0];
+    const p2 = sorted[1];
 
-  console.log(`✅ [Ball Crush MM] Matched: ${p1.username} vs ${p2.username}`);
+    // ── Remove BEFORE async call so no other invocation can pick them ─────────
+    matchmakingQueue.delete(p1.uid);
+    matchmakingQueue.delete(p2.uid);
 
-  const lobbyId = `ballcrush_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    // ── Verify both sockets still alive BEFORE creating the lobby ─────────────
+    const s1 = io.sockets.sockets.get(p1.socketId);
+    const s2 = io.sockets.sockets.get(p2.socketId);
 
-  createLobbyInFirebase(lobbyId, p1, p2)
-    .then(() => {
-      const s1 = io.sockets.sockets.get(p1.socketId);
-      const s2 = io.sockets.sockets.get(p2.socketId);
+    if (!s1 || !s1.connected) {
+      console.log(`⚠️  [Ball Crush MM] ${p1.username} disconnected before match — re-queuing ${p2.username}`);
+      if (s2 && s2.connected) matchmakingQueue.set(p2.uid, { ...p2, joinedAt: Date.now() });
+      return;
+    }
+    if (!s2 || !s2.connected) {
+      console.log(`⚠️  [Ball Crush MM] ${p2.username} disconnected before match — re-queuing ${p1.username}`);
+      if (s1 && s1.connected) matchmakingQueue.set(p1.uid, { ...p1, joinedAt: Date.now() });
+      return;
+    }
 
-      if (s1) s1.emit('matchFound', { lobbyId, opponentDisplayName: p2.displayName });
-      if (s2) s2.emit('matchFound', { lobbyId, opponentDisplayName: p1.displayName });
+    console.log(`✅ [Ball Crush MM] Matched: ${p1.username} vs ${p2.username}`);
 
-      console.log(`📨 [Ball Crush MM] matchFound sent — lobbyId=${lobbyId}`);
+    const lobbyId = `ballcrush_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-      // Re-queue survivor if one socket dropped between match and emit
-      if (s1 && !s2) { matchmakingQueue.set(p1.uid, { ...p1, joinedAt: Date.now() }); tryMatch(io); }
-      if (s2 && !s1) { matchmakingQueue.set(p2.uid, { ...p2, joinedAt: Date.now() }); tryMatch(io); }
-    })
-    .catch((err) => {
+    // ── Create lobby — re-queue both if this fails ─────────────────────────────
+    try {
+      await createLobbyInFirebase(lobbyId, p1, p2);
+    } catch (err) {
       console.error('❌ [Ball Crush MM] Lobby creation failed — re-queuing both:', err);
-      matchmakingQueue.set(p1.uid, p1);
-      matchmakingQueue.set(p2.uid, p2);
-    });
+      if (s1.connected) matchmakingQueue.set(p1.uid, { ...p1, joinedAt: Date.now() });
+      if (s2.connected) matchmakingQueue.set(p2.uid, { ...p2, joinedAt: Date.now() });
+      return;
+    }
+
+    // ── Notify both — re-check sockets after the async Firebase write ──────────
+    const still1 = io.sockets.sockets.get(p1.socketId);
+    const still2 = io.sockets.sockets.get(p2.socketId);
+
+    if (still1 && still1.connected) {
+      still1.emit('matchFound', { lobbyId, opponentDisplayName: p2.displayName });
+    } else {
+      console.log(`⚠️  [Ball Crush MM] ${p1.username} dropped after lobby created — ${lobbyId} may be orphaned`);
+    }
+    if (still2 && still2.connected) {
+      still2.emit('matchFound', { lobbyId, opponentDisplayName: p1.displayName });
+    } else {
+      console.log(`⚠️  [Ball Crush MM] ${p2.username} dropped after lobby created — ${lobbyId} may be orphaned`);
+    }
+
+    console.log(`📨 [Ball Crush MM] matchFound sent — lobbyId=${lobbyId}`);
+
+  } finally {
+    // ── Always release lock, then attempt another match if queue allows ────────
+    isMatching = false;
+    if (matchmakingQueue.size >= 2) {
+      setImmediate(() => tryMatch(io));
+    }
+  }
 }
 
 async function createLobbyInFirebase(lobbyId, p1, p2) {
@@ -68,7 +108,8 @@ async function createLobbyInFirebase(lobbyId, p1, p2) {
   console.log(`🏰 [Ball Crush MM] Lobby written to Firebase: ${lobbyId}`);
 }
 
-// Stale entry cleanup (disconnected or timed-out players)
+// ── Stale entry cleanup ───────────────────────────────────────────────────────
+
 function startMatchmakingCleanup(io) {
   setInterval(() => {
     const now = Date.now();
@@ -78,7 +119,7 @@ function startMatchmakingCleanup(io) {
       const isExpired = now - entry.joinedAt > 3 * 60_000;
 
       if (isGone || isExpired) {
-        console.log(`🧹 [Ball Crush MM] Removing stale entry for ${uid}`);
+        console.log(`🧹 [Ball Crush MM] Removing stale entry for ${uid} (gone=${isGone} expired=${isExpired})`);
         matchmakingQueue.delete(uid);
         if (!isGone && isExpired) sock.emit('matchmakingTimeout');
       }
@@ -89,9 +130,20 @@ function startMatchmakingCleanup(io) {
 // ── Socket handlers ───────────────────────────────────────────────────────────
 
 function registerBallCrushMatchmakingHandlers(io, socket) {
+
   socket.on('joinMatchmaking', (data) => {
     const { uid, username, displayName, avatar } = data || {};
     if (!uid) { console.warn('⚠️  [Ball Crush MM] joinMatchmaking with no uid — ignoring'); return; }
+
+    // ── Duplicate join guard ──────────────────────────────────────────────────
+    // If same uid joins again (reconnect / double-tap), just update socket id
+    const existing = matchmakingQueue.get(uid);
+    if (existing) {
+      existing.socketId = socket.id;
+      console.log(`♻️  [Ball Crush MM] ${username} already in queue — updated socket`);
+      socket.emit('matchmakingJoined', { position: matchmakingQueue.size });
+      return;
+    }
 
     console.log(`🎮 [Ball Crush MM] ${username} (${uid}) joining queue via ${socket.id}`);
 
