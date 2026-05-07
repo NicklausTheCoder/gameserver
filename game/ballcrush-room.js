@@ -193,6 +193,8 @@ class BallCrushRoom {
     this.active          = false;
     this.intervalId      = null;
     this.paddleX         = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 };
+    this.paddleLastX     = { bottom: BC.WIDTH / 2, top: BC.WIDTH / 2 }; // for velocity extrapolation
+    this.paddleVel       = { bottom: 0, top: 0 };
     this.health          = { bottom: BC.MAX_HEALTH, top: BC.MAX_HEALTH };
     this.score           = { bottom: 0, top: 0 };
     this.hitCount        = 0;
@@ -242,6 +244,17 @@ class BallCrushRoom {
     );
   }
 
+  // Network-compensated overlap: widens the X hitbox by NET_BUFFER px
+  // to account for paddle position arriving ~50ms stale from the client.
+  // Only used when ball is actively approaching the paddle.
+  ballOverlapsPaddleNet(ballX, ballY, paddleX, paddleY) {
+    const NET_BUFFER = 10; // px — compensates for ~50ms one-way latency at speed 9
+    return (
+      Math.abs(ballX - paddleX) <= BC.PADDLE_HALF_W + BC.BALL_RADIUS + NET_BUFFER &&
+      Math.abs(ballY - paddleY) <= BC.PADDLE_HALF_H + BC.BALL_RADIUS
+    );
+  }
+
   // ── Game loop ───────────────────────────────────────────────────────────────
 
   start() {
@@ -270,6 +283,23 @@ class BallCrushRoom {
     }
 
     if (this.processingPoint) return;
+
+    // ── Paddle extrapolation when ball is close ──────────────────────────────
+    // The server receives paddle positions ~50ms stale. When the ball is within
+    // 3 ticks of a paddle, extrapolate its position by one tick of velocity
+    // so the collision check uses a more current estimated position.
+    const EXTRAPOLATE_ZONE = Math.abs(this.ballVel.y) * 3; // 3 ticks ahead
+    if (this.ball.y + EXTRAPOLATE_ZONE >= BC.BOTTOM_PADDLE_Y - BC.PADDLE_HALF_H) {
+      // Ball approaching bottom paddle — extrapolate bottom paddle
+      const ext = Math.max(BC.PADDLE_HALF_W, Math.min(BC.WIDTH - BC.PADDLE_HALF_W, this.paddleX.bottom + this.paddleVel.bottom));
+      this.paddleX.bottom = ext;
+    }
+    if (this.ball.y - EXTRAPOLATE_ZONE <= BC.TOP_PADDLE_Y + BC.PADDLE_HALF_H) {
+      // Ball approaching top paddle — extrapolate top paddle
+      const ext = Math.max(BC.PADDLE_HALF_W, Math.min(BC.WIDTH - BC.PADDLE_HALF_W, this.paddleX.top + this.paddleVel.top));
+      this.paddleX.top = ext;
+    }
+
     // NOTE: hitCooldown is now decremented per-substep inside the loop (not here)
 
     const vel   = this.ballVel;
@@ -306,7 +336,7 @@ class BallCrushRoom {
       if (vel.y > 0 && !hitThisTick) {
         // Extend check by lookAhead in the direction of travel
         const checkY = this.ball.y + lookAhead;
-        if (this.ballOverlapsPaddle(this.ball.x, checkY, this.paddleX.bottom, BC.BOTTOM_PADDLE_Y)) {
+        if (this.ballOverlapsPaddleNet(this.ball.x, checkY, this.paddleX.bottom, BC.BOTTOM_PADDLE_Y)) {
           this.ball.y  = BC.BOTTOM_PADDLE_Y - BC.PADDLE_HALF_H - BC.BALL_RADIUS;
           this.hitCooldown = steps * 2; // block for remainder of this tick + next
           hitThisTick  = true;
@@ -318,7 +348,7 @@ class BallCrushRoom {
       // ── Top paddle ───────────────────────────────────────────────────────────
       if (vel.y < 0 && !hitThisTick) {
         const checkY = this.ball.y - lookAhead;
-        if (this.ballOverlapsPaddle(this.ball.x, checkY, this.paddleX.top, BC.TOP_PADDLE_Y)) {
+        if (this.ballOverlapsPaddleNet(this.ball.x, checkY, this.paddleX.top, BC.TOP_PADDLE_Y)) {
           this.ball.y  = BC.TOP_PADDLE_Y + BC.PADDLE_HALF_H + BC.BALL_RADIUS;
           this.hitCooldown = steps * 2;
           hitThisTick  = true;
@@ -527,7 +557,10 @@ function registerBallCrushRoomHandlers(io, socket) {
     for (const [, room] of ballCrushRooms) {
       const player = room.players.find(p => p.socketId === socket.id);
       if (player) {
-        room.paddleX[player.role] = Math.max(35, Math.min(BC.WIDTH - 35, x));
+        const clamped = Math.max(BC.PADDLE_HALF_W, Math.min(BC.WIDTH - BC.PADDLE_HALF_W, x));
+        room.paddleVel[player.role]   = clamped - room.paddleX[player.role];
+        room.paddleLastX[player.role] = room.paddleX[player.role];
+        room.paddleX[player.role]     = clamped;
         return;
       }
     }
