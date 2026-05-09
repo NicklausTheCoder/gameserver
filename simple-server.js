@@ -82,7 +82,7 @@ const {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-const { startPingLoop, registerPingHandler } = require('./utils/ping');
+const { startPingLoop, registerPingHandler, cleanupSocket } = require('./utils/ping');
 
 // ── Payment routes ────────────────────────────────────────────────────────────
 
@@ -110,11 +110,12 @@ io.on('connection', (socket) => {
   registerBallCrushRoomHandlers(io, socket);
   registerCheckersMatchmakingHandlers(io, socket);
   registerCheckersHandlers(io, socket);
-  registerPingHandler(io, socket);
+  registerPingHandler(io, socket, ballCrushRooms, checkersGameRooms);
 
   socket.on('disconnect', async () => {
     console.log('🔌 Client disconnected:', socket.id);
 
+    cleanupSocket(socket.id); // clear ping strikes + timeouts
     handleBallCrushMatchmakingDisconnect(socket);
     await handleBallCrushRoomDisconnect(socket);
     handleCheckersQueueDisconnect(socket);
