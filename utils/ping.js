@@ -5,15 +5,16 @@
 
 'use strict';
 
-const PING_INTERVAL_MS   = 5000;  // ping every 5s
-const PING_WARNING_MS    = 250;   // warn above this
-const PING_KICK_MS       = 400;   // kick threshold
-const PING_KICK_STRIKES  = 3;     // consecutive bad pings before kick
-const PING_TIMEOUT_MS    = 8000;  // if no pong in 8s, treat as infinite ping
+const PING_INTERVAL_MS   = 8000;  // ping every 8s (was 5s — less aggressive)
+const PING_WARNING_MS    = 300;   // show warning indicator above this
+const PING_KICK_MS       = 600;   // kick threshold (was 400 — too tight for Render)
+const PING_KICK_STRIKES  = 5;     // consecutive bad pings before kick (was 3)
+const PING_TIMEOUT_MS    = 10000; // no pong in 10s = strike (was 8s)
+const PING_GRACE_MS      = 15000; // don't kick during first 15s of game (cold start)
 
-const pendingPings   = new Map(); // socketId → { sentAt, roomId }
+const pendingPings   = new Map(); // socketId → { sentAt, roomId, game, startTime }
 const pingStrikes    = new Map(); // socketId → consecutive bad ping count
-const pingTimeouts   = new Map(); // socketId → timeout handle (for no-pong detection)
+const pingTimeouts   = new Map(); // socketId → timeout handle
 
 function startPingLoop(io, ballCrushRooms, checkersGameRooms) {
   setInterval(() => {
@@ -25,20 +26,13 @@ function startPingLoop(io, ballCrushRooms, checkersGameRooms) {
       for (const { socketId } of room.players) {
         const s = io.sockets.sockets.get(socketId);
         if (!s) continue;
-
-        // Cancel any existing timeout for this socket
-        if (pingTimeouts.has(socketId)) {
-          clearTimeout(pingTimeouts.get(socketId));
-        }
-
-        pendingPings.set(socketId, { sentAt: now, roomId: room.roomId, game: 'ballcrush' });
+        if (pingTimeouts.has(socketId)) clearTimeout(pingTimeouts.get(socketId));
+        pendingPings.set(socketId, { sentAt: now, roomId: room.roomId, game: 'ballcrush', startTime: room.startTime || now });
         s.emit('ping_check');
-
-        // If no pong within PING_TIMEOUT_MS, treat as infinite ping
         const t = setTimeout(() => {
           if (pendingPings.has(socketId)) {
             pendingPings.delete(socketId);
-            console.warn(`⏱️  [Ping] ${socketId} no pong in ${PING_TIMEOUT_MS}ms — counting as strike`);
+            console.warn(`⏱️  [Ping] ${socketId} no pong in ${PING_TIMEOUT_MS}ms`);
             handleHighPing(io, socketId, PING_TIMEOUT_MS, ballCrushRooms, checkersGameRooms);
           }
         }, PING_TIMEOUT_MS);
@@ -52,18 +46,13 @@ function startPingLoop(io, ballCrushRooms, checkersGameRooms) {
       for (const { socketId } of room.players) {
         const s = io.sockets.sockets.get(socketId);
         if (!s) continue;
-
-        if (pingTimeouts.has(socketId)) {
-          clearTimeout(pingTimeouts.get(socketId));
-        }
-
-        pendingPings.set(socketId, { sentAt: now, roomId: room.roomId, game: 'checkers' });
+        if (pingTimeouts.has(socketId)) clearTimeout(pingTimeouts.get(socketId));
+        pendingPings.set(socketId, { sentAt: now, roomId: room.roomId, game: 'checkers', startTime: room.createdAt || now });
         s.emit('ping_check');
-
         const t = setTimeout(() => {
           if (pendingPings.has(socketId)) {
             pendingPings.delete(socketId);
-            console.warn(`⏱️  [Ping] ${socketId} no pong — counting as strike`);
+            console.warn(`⏱️  [Ping] ${socketId} no pong in ${PING_TIMEOUT_MS}ms`);
             handleHighPing(io, socketId, PING_TIMEOUT_MS, ballCrushRooms, checkersGameRooms);
           }
         }, PING_TIMEOUT_MS);
@@ -73,14 +62,13 @@ function startPingLoop(io, ballCrushRooms, checkersGameRooms) {
   }, PING_INTERVAL_MS);
 }
 
-// ── Core handler called when a pong arrives ───────────────────────────────────
+// ── Pong handler ──────────────────────────────────────────────────────────────
 
 function registerPingHandler(io, socket, ballCrushRooms, checkersGameRooms) {
   socket.on('pong_check', () => {
     const entry = pendingPings.get(socket.id);
     if (!entry) return;
 
-    // Cancel the no-pong timeout
     if (pingTimeouts.has(socket.id)) {
       clearTimeout(pingTimeouts.get(socket.id));
       pingTimeouts.delete(socket.id);
@@ -89,13 +77,19 @@ function registerPingHandler(io, socket, ballCrushRooms, checkersGameRooms) {
     const rtt = Date.now() - entry.sentAt;
     pendingPings.delete(socket.id);
 
-    // Always broadcast RTT so clients can show ping indicator
-    io.to(entry.roomId).emit('pingWarning', { socketId: socket.id, rtt });
+    // Always send RTT back so clients can show ping indicator
+    // Send as 'pingUpdate' for good pings, 'pingWarning' only when bad
+    if (rtt > PING_WARNING_MS) {
+      io.to(entry.roomId).emit('pingWarning', { socketId: socket.id, rtt });
+    } else {
+      // Just tell the socket itself its own good ping (no need to broadcast)
+      socket.emit('pingUpdate', { rtt });
+    }
 
     if (rtt > PING_KICK_MS) {
       handleHighPing(io, socket.id, rtt, ballCrushRooms, checkersGameRooms);
     } else {
-      // Good ping — reset strike counter
+      // Good ping — reset strikes
       if (pingStrikes.has(socket.id)) {
         console.log(`✅ [Ping] ${socket.id} recovered (RTT=${rtt}ms) — strikes reset`);
         pingStrikes.delete(socket.id);
@@ -107,28 +101,31 @@ function registerPingHandler(io, socket, ballCrushRooms, checkersGameRooms) {
 // ── High ping logic ───────────────────────────────────────────────────────────
 
 function handleHighPing(io, socketId, rtt, ballCrushRooms, checkersGameRooms) {
+  const { room, game } = findRoom(socketId, ballCrushRooms, checkersGameRooms);
+  if (!room) return;
+
+  // ── Grace period: don't kick during first PING_GRACE_MS of a game ────────
+  // This prevents cold-start Render latency from causing false kicks.
+  const roomAge = Date.now() - (room.startTime || room.createdAt || Date.now());
+  if (roomAge < PING_GRACE_MS) {
+    console.log(`⏳ [Ping] ${socketId} RTT=${rtt}ms but in grace period (${Math.round(roomAge/1000)}s < ${PING_GRACE_MS/1000}s) — ignoring`);
+    return;
+  }
+
   const strikes = (pingStrikes.get(socketId) || 0) + 1;
   pingStrikes.set(socketId, strikes);
 
   console.warn(`⚠️  [Ping] ${socketId} RTT=${rtt}ms — strike ${strikes}/${PING_KICK_STRIKES}`);
 
-  // Find which room this socket is in
-  const { room, game } = findRoom(socketId, ballCrushRooms, checkersGameRooms);
-  if (!room) return;
-
-  // Warn the lagging player how many strikes they have left
-  const lagSocket = io.sockets.sockets.get(socketId);
-  const remaining = PING_KICK_STRIKES - strikes;
+  const lagSocket  = io.sockets.sockets.get(socketId);
+  const remaining  = PING_KICK_STRIKES - strikes;
 
   if (lagSocket) {
     lagSocket.emit('pingKickWarning', {
-      rtt,
-      strikes,
-      maxStrikes: PING_KICK_STRIKES,
-      remaining,
+      rtt, strikes, maxStrikes: PING_KICK_STRIKES, remaining,
       message: remaining > 0
         ? `High ping (${rtt}ms). ${remaining} warning${remaining === 1 ? '' : 's'} before disconnect.`
-        : `Disconnecting due to high ping (${rtt}ms).`,
+        : `Disconnecting due to sustained high ping (${rtt}ms).`,
     });
   }
 
@@ -143,14 +140,13 @@ function handleHighPing(io, socketId, rtt, ballCrushRooms, checkersGameRooms) {
 async function kickForHighPing(io, socketId, rtt, room, game) {
   if (!room.active) return;
 
-  const kickedPlayer   = room.players.find(p => p.socketId === socketId);
-  const survivorPlayer = room.players.find(p => p.socketId !== socketId);
+  const kicked   = room.players.find(p => p.socketId === socketId);
+  const survivor = room.players.find(p => p.socketId !== socketId);
 
-  if (!kickedPlayer || !survivorPlayer) return;
+  if (!kicked || !survivor) return;
 
-  console.log(`🔌 [Ping] Kicking ${kickedPlayer.username} (RTT=${rtt}ms) from ${room.roomId} — awarding win to ${survivorPlayer.username}`);
+  console.log(`🔌 [Ping] Kicking ${kicked.username} (RTT=${rtt}ms) — awarding win to ${survivor.username}`);
 
-  // Tell the kicked player why
   const kickedSocket = io.sockets.sockets.get(socketId);
   if (kickedSocket) {
     kickedSocket.emit('kickedForPing', {
@@ -159,41 +155,26 @@ async function kickForHighPing(io, socketId, rtt, room, game) {
     });
   }
 
-  // Tell the room (both players) what happened — survivor sees win screen
-  io.to(room.roomId).emit('opponentKickedForPing', {
-    kickedUsername: kickedPlayer.username,
-    rtt,
-  });
+  io.to(room.roomId).emit('opponentKickedForPing', { kickedUsername: kicked.username, rtt });
 
-  // Award win through the existing endGame / endAndPersist path
   if (game === 'ballcrush') {
-    await room.endGame(survivorPlayer.role);
+    await room.endGame(survivor.role);
   } else if (game === 'checkers') {
-    io.to(room.roomId).emit('checkers:gameOver', {
-      winnerUid: survivorPlayer.uid,
-      reason:    'disconnect',
-    });
-    await room.endAndPersist(survivorPlayer.uid, 'pingkick');
+    io.to(room.roomId).emit('checkers:gameOver', { winnerUid: survivor.uid, reason: 'disconnect' });
+    await room.endAndPersist(survivor.uid, 'pingkick');
   }
 
-  // Force-disconnect the socket
-  if (kickedSocket) {
-    kickedSocket.disconnect(true);
-  }
+  if (kickedSocket) kickedSocket.disconnect(true);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function findRoom(socketId, ballCrushRooms, checkersGameRooms) {
   for (const [, room] of ballCrushRooms) {
-    if (room.players.some(p => p.socketId === socketId)) {
-      return { room, game: 'ballcrush' };
-    }
+    if (room.players.some(p => p.socketId === socketId)) return { room, game: 'ballcrush' };
   }
   for (const [, room] of checkersGameRooms) {
-    if (room.players.some(p => p.socketId === socketId)) {
-      return { room, game: 'checkers' };
-    }
+    if (room.players.some(p => p.socketId === socketId)) return { room, game: 'checkers' };
   }
   return { room: null, game: null };
 }
@@ -207,8 +188,4 @@ function cleanupSocket(socketId) {
   }
 }
 
-module.exports = {
-  startPingLoop,
-  registerPingHandler,
-  cleanupSocket,
-};
+module.exports = { startPingLoop, registerPingHandler, cleanupSocket };
