@@ -20,8 +20,9 @@ console.log('Gateway mode:', process.env.PAYMENT_GATEWAY);
 const admin          = require('firebase-admin');
 const serviceAccount = require('./firebase.json');
 
+
 admin.initializeApp({
-  credential:  admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
   databaseURL: 'https://wintapgames-31286-default-rtdb.firebaseio.com',
 });
 
