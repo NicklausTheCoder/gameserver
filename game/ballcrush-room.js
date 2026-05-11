@@ -471,9 +471,30 @@ class BallCrushRoom {
           duration,
         })
       );
-      // Award prize to wallet
+      // Award prize to winningsBalance — separate from wallet (deposits/entry fees)
       promises.push(
-        walletTransact(winner.uid, BC.PRIZE, 'win', `Ball Crush win in lobby ${this.roomId}`)
+        (async () => {
+          try {
+            const winningsRef  = db().ref(`winningsBalance/${winner.uid}`);
+            const winningsSnap = await winningsRef.once('value');
+            const current      = winningsSnap.exists() ? (winningsSnap.val().balance || 0) : 0;
+            await winningsRef.update({
+              balance:     Math.round((current + BC.PRIZE) * 100) / 100,
+              lastUpdated: new Date().toISOString(),
+            });
+            // Log under winnings/ so it appears in earnings history
+            await db().ref(`winnings/${winner.uid}/${this.roomId}`).set({
+              amount:    BC.PRIZE,
+              game:      'ball-crush',
+              type:      'game_win',
+              lobbyId:   this.roomId,
+              awardedAt: new Date().toISOString(),
+            });
+            console.log(`💰 [Ball Crush] $${BC.PRIZE} → winningsBalance for ${winner.uid}`);
+          } catch (err) {
+            console.error('❌ [Ball Crush] Failed to award winnings:', err.message);
+          }
+        })()
       );
     }
 
