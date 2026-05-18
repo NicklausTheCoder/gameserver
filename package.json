@@ -5,7 +5,7 @@
   "main": "simple-server.js",
   "scripts": {
     "build": "echo 'No build step required'",
-    "start": "node simple-server.js",
+    "start": "ntpdate -u time.google.com; node simple-server.js",
     "dev": "nodemon simple-server.js"
   },
   "dependencies": {
