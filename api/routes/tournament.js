@@ -59,11 +59,21 @@ async function completePeriod(gameId, periodId) {
     }
   });
 
+   
+
   if (!winnerUid) {
     await db().ref(`tournaments/${gameId}/${periodId}`).update({ status: 'completed' });
     console.log(`🏁 [Tournament] ${periodId} ended with no players`);
     return;
   }
+
+  if (highestScore == 0) {
+
+    await db().ref(`tournaments/${gameId}/${periodId}`).update({ status: 'completed' });
+    console.log(`🏁 [Tournament] ${periodId} ended with no winners`);
+    return;
+
+   }
 
   const prize = Math.round(period.totalPool * 0.4 * 100) / 100 + 1;
   const winner = { uid: winnerUid, username: winnerUsername, displayName: winnerDisplayName, score: highestScore, prize };
